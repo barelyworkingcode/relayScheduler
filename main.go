@@ -57,18 +57,21 @@ func main() {
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, scheduler, logStore)
 
+	serverErr := make(chan error, 1)
 	go func() {
 		addr := fmt.Sprintf(":%s", *port)
 		slog.Info("API listening", "addr", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
-			slog.Error("API server error", "error", err)
-		}
+		serverErr <- http.ListenAndServe(addr, mux)
 	}()
 
-	// Wait for shutdown.
+	// Wait for shutdown or server failure.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	select {
+	case err := <-serverErr:
+		slog.Error("API server failed", "error", err)
+	case <-sig:
+	}
 
 	slog.Info("shutting down")
 	scheduler.Stop()

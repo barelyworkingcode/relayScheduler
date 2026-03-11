@@ -59,6 +59,10 @@ func (c *LLMClient) ListProjects() ([]Project, error) {
 		return nil, err
 	}
 
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("list projects failed (%d): %s", resp.StatusCode, body)
+	}
+
 	var projects []Project
 	if err := json.Unmarshal(body, &projects); err != nil {
 		return nil, fmt.Errorf("parse projects: %w", err)

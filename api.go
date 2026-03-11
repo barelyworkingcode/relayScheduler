@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -11,14 +10,6 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
-}
-
-func readJSON(r *http.Request, v interface{}) error {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, v)
 }
 
 // RegisterRoutes sets up the HTTP API for task management.
@@ -63,8 +54,8 @@ func RegisterRoutes(mux *http.ServeMux, scheduler *Scheduler, logStore *LogStore
 					return
 				}
 				go scheduler.RunTaskNow(projectID, taskID)
-				writeJSON(w, 200, map[string]string{
-					"success": "true",
+				writeJSON(w, 200, map[string]interface{}{
+					"success": true,
 					"message": "Task execution started",
 				})
 				return

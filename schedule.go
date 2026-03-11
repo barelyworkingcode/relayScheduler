@@ -22,17 +22,23 @@ func CalculateNextRun(scheduleRaw json.RawMessage) (time.Time, error) {
 	switch base.Type {
 	case "daily":
 		var s DailySchedule
-		json.Unmarshal(scheduleRaw, &s)
+		if err := json.Unmarshal(scheduleRaw, &s); err != nil {
+			return time.Time{}, fmt.Errorf("parse daily schedule: %w", err)
+		}
 		return nextDaily(now, s.Time), nil
 
 	case "hourly":
 		var s HourlySchedule
-		json.Unmarshal(scheduleRaw, &s)
+		if err := json.Unmarshal(scheduleRaw, &s); err != nil {
+			return time.Time{}, fmt.Errorf("parse hourly schedule: %w", err)
+		}
 		return nextHourly(now, s.Minute), nil
 
 	case "interval":
 		var s IntervalSchedule
-		json.Unmarshal(scheduleRaw, &s)
+		if err := json.Unmarshal(scheduleRaw, &s); err != nil {
+			return time.Time{}, fmt.Errorf("parse interval schedule: %w", err)
+		}
 		if s.Minutes <= 0 {
 			s.Minutes = 60
 		}
@@ -40,12 +46,16 @@ func CalculateNextRun(scheduleRaw json.RawMessage) (time.Time, error) {
 
 	case "weekly":
 		var s WeeklySchedule
-		json.Unmarshal(scheduleRaw, &s)
+		if err := json.Unmarshal(scheduleRaw, &s); err != nil {
+			return time.Time{}, fmt.Errorf("parse weekly schedule: %w", err)
+		}
 		return nextWeekly(now, s.Day, s.Time), nil
 
 	case "cron":
 		var s CronSchedule
-		json.Unmarshal(scheduleRaw, &s)
+		if err := json.Unmarshal(scheduleRaw, &s); err != nil {
+			return time.Time{}, fmt.Errorf("parse cron schedule: %w", err)
+		}
 		return nextCron(now, s.Expression), nil
 
 	default:
@@ -67,7 +77,7 @@ func nextDaily(now time.Time, timeStr string) time.Time {
 	h, m := parseTime(timeStr)
 	next := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
 	if !next.After(now) {
-		next = next.Add(24 * time.Hour)
+		next = time.Date(now.Year(), now.Month(), now.Day()+1, h, m, 0, 0, now.Location())
 	}
 	return next
 }
@@ -97,17 +107,15 @@ func nextWeekly(now time.Time, day, timeStr string) time.Time {
 	}
 	h, m := parseTime(timeStr)
 
-	next := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
-
 	// Move to the target day of the week.
 	daysUntil := int(targetDay) - int(now.Weekday())
 	if daysUntil < 0 {
 		daysUntil += 7
 	}
-	next = next.Add(time.Duration(daysUntil) * 24 * time.Hour)
 
+	next := time.Date(now.Year(), now.Month(), now.Day()+daysUntil, h, m, 0, 0, now.Location())
 	if !next.After(now) {
-		next = next.Add(7 * 24 * time.Hour)
+		next = time.Date(next.Year(), next.Month(), next.Day()+7, h, m, 0, 0, next.Location())
 	}
 	return next
 }
@@ -127,7 +135,7 @@ func nextCron(now time.Time, expression string) time.Time {
 		h, _ := strconv.Atoi(hour)
 		next := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
 		if !next.After(now) {
-			next = next.Add(24 * time.Hour)
+			next = time.Date(now.Year(), now.Month(), now.Day()+1, h, m, 0, 0, now.Location())
 		}
 		return next
 	}

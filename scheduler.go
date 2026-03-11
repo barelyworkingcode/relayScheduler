@@ -205,8 +205,8 @@ func (s *Scheduler) reschedule(project Project, task Task) {
 }
 
 func (s *Scheduler) watchLoop() {
-	// Debounce: batch changes within 100ms.
-	var debounce *time.Timer
+	// Debounce per project directory: batch changes within 100ms.
+	debounceTimers := make(map[string]*time.Timer)
 
 	for {
 		select {
@@ -217,11 +217,11 @@ func (s *Scheduler) watchLoop() {
 			if filepath.Base(event.Name) != tasksFilename {
 				continue
 			}
-			if debounce != nil {
-				debounce.Stop()
-			}
 			projectDir := filepath.Dir(event.Name)
-			debounce = time.AfterFunc(100*time.Millisecond, func() {
+			if t, ok := debounceTimers[projectDir]; ok {
+				t.Stop()
+			}
+			debounceTimers[projectDir] = time.AfterFunc(100*time.Millisecond, func() {
 				s.reloadProjectByPath(projectDir)
 			})
 
@@ -309,7 +309,7 @@ func (s *Scheduler) GetAllTasks() []map[string]interface{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var result []map[string]interface{}
+	result := make([]map[string]interface{}, 0)
 	for _, st := range s.tasks {
 		result = append(result, map[string]interface{}{
 			"id":          st.task.ID,
