@@ -54,3 +54,10 @@ POST /api/tasks/:projectId/:taskId/run   — run task immediately
 ```bash
 go build .
 ```
+
+## Ecosystem
+
+relayScheduler is part of the Relay ecosystem. It requires relayLLM for project discovery and LLM execution.
+
+- `../relay/` -- MCP orchestrator. Manages relayScheduler as a background service.
+- `../relayLLM/` -- LLM engine. Provides the projects and sessions API that relayScheduler calls.
