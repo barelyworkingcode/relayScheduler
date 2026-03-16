@@ -2,12 +2,6 @@ package main
 
 import "encoding/json"
 
-// TaskFile is the structure of a .tasks.json file.
-type TaskFile struct {
-	Version int    `json:"version"`
-	Tasks   []Task `json:"tasks"`
-}
-
 // Task defines a scheduled LLM task.
 type Task struct {
 	ID        string          `json:"id"`
@@ -16,8 +10,12 @@ type Task struct {
 	Schedule  json.RawMessage `json:"schedule"`
 	Enabled   bool            `json:"enabled"`
 	Model     string          `json:"model,omitempty"`
-	Args      []string        `json:"args,omitempty"`
+	ProjectID string          `json:"projectId"`
 	CreatedAt string          `json:"createdAt"`
+	UpdatedAt string          `json:"updatedAt,omitempty"`
+	LastRun   string          `json:"lastRun,omitempty"`
+	LastStatus    string `json:"lastStatus,omitempty"` // "success", "error", ""
+	LastSessionID string `json:"lastSessionId,omitempty"`
 }
 
 // Schedule types parsed from the schedule JSON.
@@ -48,12 +46,21 @@ type CronSchedule struct {
 	Expression string `json:"expression"`
 }
 
+type OnceSchedule struct {
+	Type string `json:"type"`
+	At   string `json:"at"` // ISO8601
+}
+
+type OnDemandSchedule struct {
+	Type string `json:"type"`
+}
+
 // Execution records a single task run.
 type Execution struct {
 	TaskID      string        `json:"taskId"`
 	TaskName    string        `json:"taskName"`
 	ProjectID   string        `json:"projectId"`
-	ProjectName string        `json:"projectName"`
+	SessionID   string        `json:"sessionId,omitempty"`
 	StartedAt   string        `json:"startedAt"`
 	CompletedAt string        `json:"completedAt,omitempty"`
 	Status      string        `json:"status"` // "running", "success", "error"

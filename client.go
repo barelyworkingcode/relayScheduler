@@ -15,13 +15,6 @@ type LLMClient struct {
 	http    *http.Client
 }
 
-type Project struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Path  string `json:"path"`
-	Model string `json:"model"`
-}
-
 type SessionResponse struct {
 	SessionID string `json:"sessionId"`
 	Model     string `json:"model"`
@@ -47,34 +40,12 @@ func NewLLMClient(baseURL string) *LLMClient {
 	}
 }
 
-func (c *LLMClient) ListProjects() ([]Project, error) {
-	resp, err := c.http.Get(c.baseURL + "/api/projects")
-	if err != nil {
-		return nil, fmt.Errorf("list projects: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("list projects failed (%d): %s", resp.StatusCode, body)
-	}
-
-	var projects []Project
-	if err := json.Unmarshal(body, &projects); err != nil {
-		return nil, fmt.Errorf("parse projects: %w", err)
-	}
-	return projects, nil
-}
-
-func (c *LLMClient) CreateSession(projectID, model string) (*SessionResponse, error) {
-	payload, _ := json.Marshal(map[string]string{
+func (c *LLMClient) CreateSession(projectID, model, name string) (*SessionResponse, error) {
+	payload, _ := json.Marshal(map[string]interface{}{
 		"projectId": projectID,
 		"model":     model,
-		"name":      "Scheduled Task",
+		"name":      name,
+		"settings":  map[string]bool{"headless": true},
 	})
 
 	resp, err := c.http.Post(c.baseURL+"/api/sessions", "application/json", bytes.NewReader(payload))

@@ -53,6 +53,16 @@ GET  /api/tasks/:projectId/:taskId/history   -- execution history
 POST /api/tasks/:projectId/:taskId/run       -- run task immediately
 ```
 
+## Headless Sessions
+
+All scheduler-created sessions include `settings: {headless: true}` in the session creation payload. relayLLM uses this to:
+
+- Pass `--dangerously-skip-permissions --permission-mode bypassPermissions` to Claude CLI
+- Set `RELAY_LLM_HEADLESS=true` env var so the PreToolUse hook auto-approves all tool use
+- Disallow `EnterPlanMode` and `AskUserQuestion` tools (no human to respond)
+
+This prevents tasks from stalling on permission prompts or plan mode approval.
+
 ## Ecosystem
 
 relayScheduler is part of the Relay ecosystem. It requires [relayLLM](https://github.com/barelyworkingcode/relayLLM) for project discovery and LLM execution.

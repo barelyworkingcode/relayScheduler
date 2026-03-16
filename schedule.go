@@ -58,6 +58,23 @@ func CalculateNextRun(scheduleRaw json.RawMessage) (time.Time, error) {
 		}
 		return nextCron(now, s.Expression), nil
 
+	case "once":
+		var s OnceSchedule
+		if err := json.Unmarshal(scheduleRaw, &s); err != nil {
+			return time.Time{}, fmt.Errorf("parse once schedule: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339, s.At)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parse once schedule 'at': %w", err)
+		}
+		if !t.After(now) {
+			return time.Time{}, fmt.Errorf("once schedule 'at' is in the past: %s", s.At)
+		}
+		return t, nil
+
+	case "on_demand":
+		return now, nil
+
 	default:
 		return time.Time{}, fmt.Errorf("unknown schedule type: %s", base.Type)
 	}

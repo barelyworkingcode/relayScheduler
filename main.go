@@ -9,14 +9,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 )
 
 func main() {
 	llmURL := flag.String("llm-url", envOrDefault("RELAY_LLM_URL", "http://localhost:3001"), "relayLLM base URL")
-	dataDir := flag.String("data-dir", envOrDefault("RELAY_SCHEDULER_DATA", ""), "Data directory for logs")
+	dataDir := flag.String("data-dir", envOrDefault("RELAY_SCHEDULER_DATA", ""), "Data directory for tasks and logs")
 	port := flag.String("port", envOrDefault("RELAY_SCHEDULER_PORT", "3002"), "HTTP API listen port")
-	pollInterval := flag.Duration("poll", 30*time.Second, "How often to poll relayLLM for project list")
 	flag.Parse()
 
 	if *dataDir == "" {
@@ -34,28 +32,20 @@ func main() {
 	slog.Info("starting relayScheduler", "llmURL", *llmURL, "dataDir", *dataDir)
 
 	client := NewLLMClient(*llmURL)
+	store := NewTaskStore(*dataDir)
 	logStore := NewLogStore(filepath.Join(*dataDir, "task-logs"))
-	scheduler := NewScheduler(client, logStore)
+	hub := NewHub(store)
+	scheduler := NewScheduler(client, store, logStore, hub)
 
-	// Initial load.
-	if err := scheduler.LoadProjects(); err != nil {
-		slog.Error("initial project load failed", "error", err)
+	// Load tasks from store and schedule them.
+	if err := scheduler.LoadAllTasks(); err != nil {
+		slog.Error("failed to load tasks", "error", err)
 	}
 
-	// Periodic project poll (picks up new projects, path changes).
-	go func() {
-		ticker := time.NewTicker(*pollInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			if err := scheduler.LoadProjects(); err != nil {
-				slog.Error("project poll failed", "error", err)
-			}
-		}
-	}()
-
-	// HTTP API for task management.
+	// HTTP API.
 	mux := http.NewServeMux()
-	RegisterRoutes(mux, scheduler, logStore)
+	RegisterRoutes(mux, store, scheduler, logStore)
+	mux.HandleFunc("/ws", HandleWS(hub))
 
 	serverErr := make(chan error, 1)
 	go func() {

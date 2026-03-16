@@ -55,6 +55,10 @@ POST /api/tasks/:projectId/:taskId/run   — run task immediately
 go build .
 ```
 
+## Headless Sessions
+
+`client.go` sends `settings: {headless: true}` on every `CreateSession` call. relayLLM handles the mapping to CLI flags and hook behavior -- the scheduler doesn't need to know about Claude-specific details.
+
 ## Ecosystem
 
 relayScheduler is part of the Relay ecosystem. It requires relayLLM for project discovery and LLM execution.

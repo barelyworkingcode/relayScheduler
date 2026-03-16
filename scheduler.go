@@ -3,116 +3,113 @@ package main
 import (
 	"encoding/json"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
-const tasksFilename = ".tasks.json"
-
 type scheduledTask struct {
-	projectID   string
-	projectName string
-	task        Task
-	timer       *time.Timer
-	nextRun     time.Time
+	task    Task
+	timer   *time.Timer
+	nextRun time.Time
 }
 
-// Scheduler loads tasks from project directories and runs them on schedule.
+// Scheduler manages task timers and executes tasks via the LLM client.
 type Scheduler struct {
 	mu       sync.Mutex
 	client   *LLMClient
+	store    *TaskStore
 	logStore *LogStore
-	tasks    map[string]*scheduledTask // key: "projectId:taskId"
-	watcher  *fsnotify.Watcher
-	projects []Project
+	hub      *Hub
+	tasks    map[string]*scheduledTask // key: taskID
 	running  bool
 }
 
-func NewScheduler(client *LLMClient, logStore *LogStore) *Scheduler {
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
-		slog.Error("failed to create file watcher", "error", err)
-	}
-
-	s := &Scheduler{
+func NewScheduler(client *LLMClient, store *TaskStore, logStore *LogStore, hub *Hub) *Scheduler {
+	return &Scheduler{
 		client:   client,
+		store:    store,
 		logStore: logStore,
+		hub:      hub,
 		tasks:    make(map[string]*scheduledTask),
-		watcher:  w,
 		running:  true,
 	}
-
-	if w != nil {
-		go s.watchLoop()
-	}
-	return s
 }
 
-// LoadProjects fetches the project list from relayLLM and loads tasks.
-func (s *Scheduler) LoadProjects() error {
-	projects, err := s.client.ListProjects()
+// LoadAllTasks reads all tasks from the store and schedules enabled ones.
+func (s *Scheduler) LoadAllTasks() error {
+	tasks, err := s.store.Load()
 	if err != nil {
 		return err
 	}
 
 	s.mu.Lock()
-	s.projects = projects
-	s.mu.Unlock()
-
-	for _, p := range projects {
-		s.loadProjectTasks(p)
-	}
-	return nil
-}
-
-func (s *Scheduler) loadProjectTasks(project Project) {
-	tasksPath := filepath.Join(project.Path, tasksFilename)
-	data, err := os.ReadFile(tasksPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Error("failed to read tasks file", "project", project.Name, "error", err)
-		}
-		return
-	}
-
-	var tf TaskFile
-	if err := json.Unmarshal(data, &tf); err != nil {
-		slog.Error("failed to parse tasks file", "project", project.Name, "error", err)
-		return
-	}
-
-	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Clear existing tasks for this project.
-	for key, st := range s.tasks {
-		if st.projectID == project.ID {
-			st.timer.Stop()
-			delete(s.tasks, key)
-		}
+	// Cancel existing timers.
+	for _, st := range s.tasks {
+		st.timer.Stop()
 	}
+	s.tasks = make(map[string]*scheduledTask)
 
-	// Schedule enabled tasks.
-	for _, task := range tf.Tasks {
+	for _, task := range tasks {
+		// Reset stale "running" status from crash recovery.
+		if task.LastStatus == "running" {
+			slog.Warn("resetting stale running task", "task", task.Name, "id", task.ID)
+			s.store.SetLastRun(task.ID, "error")
+		}
 		if !task.Enabled {
 			continue
 		}
-		s.scheduleTaskLocked(project, task)
+		s.scheduleTaskLocked(task)
 	}
 
-	// Watch the project directory for .tasks.json changes.
-	if s.watcher != nil {
-		s.watcher.Add(project.Path)
-	}
-
-	slog.Info("loaded tasks", "project", project.Name, "count", len(tf.Tasks))
+	slog.Info("loaded tasks from store", "total", len(tasks), "scheduled", len(s.tasks))
+	return nil
 }
 
-func (s *Scheduler) scheduleTaskLocked(project Project, task Task) {
+// ScheduleTask schedules (or reschedules) a single task.
+func (s *Scheduler) ScheduleTask(task Task) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Cancel existing timer if any.
+	if st, ok := s.tasks[task.ID]; ok {
+		st.timer.Stop()
+		delete(s.tasks, task.ID)
+	}
+
+	if !task.Enabled {
+		return
+	}
+
+	s.scheduleTaskLocked(task)
+}
+
+// UnscheduleTask cancels the timer for a task.
+func (s *Scheduler) UnscheduleTask(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if st, ok := s.tasks[taskID]; ok {
+		st.timer.Stop()
+		delete(s.tasks, taskID)
+	}
+}
+
+// UnscheduleByProject cancels all timers for tasks belonging to a project.
+func (s *Scheduler) UnscheduleByProject(projectID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, st := range s.tasks {
+		if st.task.ProjectID == projectID {
+			st.timer.Stop()
+			delete(s.tasks, id)
+		}
+	}
+}
+
+func (s *Scheduler) scheduleTaskLocked(task Task) {
 	nextRun, err := CalculateNextRun(task.Schedule)
 	if err != nil {
 		slog.Error("failed to calculate next run", "task", task.Name, "error", err)
@@ -124,51 +121,71 @@ func (s *Scheduler) scheduleTaskLocked(project Project, task Task) {
 		delay = 0
 	}
 
-	key := project.ID + ":" + task.ID
+	taskCopy := task
 	st := &scheduledTask{
-		projectID:   project.ID,
-		projectName: project.Name,
-		task:        task,
-		nextRun:     nextRun,
+		task:    taskCopy,
+		nextRun: nextRun,
 	}
 
 	st.timer = time.AfterFunc(delay, func() {
-		s.executeTask(project, task)
+		s.executeTask(taskCopy)
 	})
 
-	s.tasks[key] = st
-	slog.Info("scheduled task", "task", task.Name, "project", project.Name, "nextRun", nextRun.Format(time.RFC3339))
+	s.tasks[task.ID] = st
+	slog.Info("scheduled task", "task", task.Name, "nextRun", nextRun.Format(time.RFC3339))
 }
 
-func (s *Scheduler) executeTask(project Project, task Task) {
-	slog.Info("executing task", "task", task.Name, "project", project.Name)
+func (s *Scheduler) executeTask(task Task) {
+	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID)
+
+	// End previous session if one exists (one live session per task max).
+	if current, err := s.store.Get(task.ID); err == nil && current != nil && current.LastSessionID != "" {
+		s.client.EndSession(current.LastSessionID)
+	}
 
 	exec := Execution{
-		TaskID:      task.ID,
-		TaskName:    task.Name,
-		ProjectID:   project.ID,
-		ProjectName: project.Name,
-		StartedAt:   time.Now().UTC().Format(time.RFC3339),
-		Status:      "running",
+		TaskID:    task.ID,
+		TaskName:  task.Name,
+		ProjectID: task.ProjectID,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Status:    "running",
 	}
 
-	// Determine model: task override or project default.
+	// Mark task as running so clients can detect in-progress execution.
+	s.store.SetLastRun(task.ID, "running")
+
 	model := task.Model
-	if model == "" {
-		model = project.Model
-	}
 
 	// Create a headless session via relayLLM.
-	session, err := s.client.CreateSession(project.ID, model)
+	session, err := s.client.CreateSession(task.ProjectID, model, task.Name)
 	if err != nil {
 		exec.Status = "error"
 		exec.Error = err.Error()
 		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		slog.Error("task session creation failed", "task", task.Name, "error", err)
-		s.logStore.Log(project.ID, task.ID, exec)
-		s.reschedule(project, task)
+		s.logStore.Log(task.ProjectID, task.ID, exec)
+		s.store.SetLastRun(task.ID, "error")
+		s.hub.Broadcast(map[string]string{
+			"type":      "task_error",
+			"taskId":    task.ID,
+			"projectId": task.ProjectID,
+			"taskName":  task.Name,
+			"error":     err.Error(),
+		})
+		s.rescheduleOrDisable(task)
 		return
 	}
+
+	exec.SessionID = session.SessionID
+
+	// Broadcast task_started now that we have a sessionId.
+	s.hub.Broadcast(map[string]string{
+		"type":      "task_started",
+		"taskId":    task.ID,
+		"projectId": task.ProjectID,
+		"taskName":  task.Name,
+		"sessionId": session.SessionID,
+	})
 
 	// Send the prompt and wait for the response.
 	result, err := s.client.SendMessage(session.SessionID, task.Prompt)
@@ -182,73 +199,67 @@ func (s *Scheduler) executeTask(project Project, task Task) {
 		exec.Response = result.Response
 		exec.Stats = &result.Stats
 		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		slog.Info("task completed", "task", task.Name, "project", project.Name,
+		slog.Info("task completed", "task", task.Name,
 			"tokens", result.Stats.InputTokens+result.Stats.OutputTokens)
 	}
 
-	// Clean up the session.
-	s.client.EndSession(session.SessionID)
+	// Keep session alive for click-to-join (no EndSession call).
 
 	// Log the execution.
-	s.logStore.Log(project.ID, task.ID, exec)
+	s.logStore.Log(task.ProjectID, task.ID, exec)
 
-	// Reschedule if still running.
-	s.reschedule(project, task)
+	// Update last run status and session ID in store.
+	s.store.SetLastRun(task.ID, exec.Status)
+	s.store.SetLastSessionID(task.ID, session.SessionID)
+
+	// Broadcast completion or error.
+	if exec.Status == "error" {
+		s.hub.Broadcast(map[string]string{
+			"type":      "task_error",
+			"taskId":    task.ID,
+			"projectId": task.ProjectID,
+			"taskName":  task.Name,
+			"error":     exec.Error,
+		})
+	} else {
+		s.hub.Broadcast(map[string]interface{}{
+			"type":      "task_completed",
+			"taskId":    task.ID,
+			"projectId": task.ProjectID,
+			"taskName":  task.Name,
+			"sessionId": session.SessionID,
+			"status":    exec.Status,
+		})
+	}
+
+	// Reschedule or disable.
+	s.rescheduleOrDisable(task)
 }
 
-func (s *Scheduler) reschedule(project Project, task Task) {
+func (s *Scheduler) rescheduleOrDisable(task Task) {
+	// For once/immediate: disable instead of rescheduling.
+	var base struct {
+		Type string `json:"type"`
+	}
+	json.Unmarshal(task.Schedule, &base)
+
+	if base.Type == "once" || base.Type == "on_demand" {
+		s.store.SetEnabled(task.ID, false)
+		s.mu.Lock()
+		delete(s.tasks, task.ID)
+		s.mu.Unlock()
+		slog.Info("disabled one-shot task after execution", "task", task.Name)
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.running {
-		s.scheduleTaskLocked(project, task)
+		s.scheduleTaskLocked(task)
 	}
 }
 
-func (s *Scheduler) watchLoop() {
-	// Debounce per project directory: batch changes within 100ms.
-	debounceTimers := make(map[string]*time.Timer)
-
-	for {
-		select {
-		case event, ok := <-s.watcher.Events:
-			if !ok {
-				return
-			}
-			if filepath.Base(event.Name) != tasksFilename {
-				continue
-			}
-			projectDir := filepath.Dir(event.Name)
-			if t, ok := debounceTimers[projectDir]; ok {
-				t.Stop()
-			}
-			debounceTimers[projectDir] = time.AfterFunc(100*time.Millisecond, func() {
-				s.reloadProjectByPath(projectDir)
-			})
-
-		case err, ok := <-s.watcher.Errors:
-			if !ok {
-				return
-			}
-			slog.Error("file watcher error", "error", err)
-		}
-	}
-}
-
-func (s *Scheduler) reloadProjectByPath(projectDir string) {
-	s.mu.Lock()
-	projects := s.projects
-	s.mu.Unlock()
-
-	for _, p := range projects {
-		if p.Path == projectDir {
-			slog.Info("reloading tasks", "project", p.Name)
-			s.loadProjectTasks(p)
-			return
-		}
-	}
-}
-
-// Stop cancels all scheduled tasks and closes the file watcher.
+// Stop cancels all scheduled tasks.
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	s.running = false
@@ -257,54 +268,23 @@ func (s *Scheduler) Stop() {
 	}
 	s.tasks = make(map[string]*scheduledTask)
 	s.mu.Unlock()
-
-	if s.watcher != nil {
-		s.watcher.Close()
-	}
 }
 
-// RunTaskNow finds and executes a task immediately, bypassing the schedule.
-func (s *Scheduler) RunTaskNow(projectID, taskID string) {
-	s.mu.Lock()
-	var project Project
-	for _, p := range s.projects {
-		if p.ID == projectID {
-			project = p
-			break
-		}
-	}
-	s.mu.Unlock()
-
-	if project.ID == "" {
-		slog.Error("project not found for manual run", "projectId", projectID)
-		return
-	}
-
-	// Read the task from the tasks file.
-	tasksPath := filepath.Join(project.Path, tasksFilename)
-	data, err := os.ReadFile(tasksPath)
+// RunTaskNow executes a task immediately, bypassing the schedule.
+func (s *Scheduler) RunTaskNow(taskID string) error {
+	task, err := s.store.Get(taskID)
 	if err != nil {
-		slog.Error("failed to read tasks file for manual run", "error", err)
-		return
+		return err
 	}
-
-	var tf TaskFile
-	if err := json.Unmarshal(data, &tf); err != nil {
-		slog.Error("failed to parse tasks file for manual run", "error", err)
-		return
+	if task == nil {
+		slog.Error("task not found for manual run", "taskId", taskID)
+		return nil
 	}
-
-	for _, task := range tf.Tasks {
-		if task.ID == taskID {
-			s.executeTask(project, task)
-			return
-		}
-	}
-
-	slog.Error("task not found for manual run", "projectId", projectID, "taskId", taskID)
+	go s.executeTask(*task)
+	return nil
 }
 
-// GetAllTasks returns all loaded tasks with their next run times.
+// GetAllTasks returns all scheduled tasks with their next run times.
 func (s *Scheduler) GetAllTasks() []map[string]interface{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -312,13 +292,12 @@ func (s *Scheduler) GetAllTasks() []map[string]interface{} {
 	result := make([]map[string]interface{}, 0)
 	for _, st := range s.tasks {
 		result = append(result, map[string]interface{}{
-			"id":          st.task.ID,
-			"name":        st.task.Name,
-			"projectId":   st.projectID,
-			"projectName": st.projectName,
-			"enabled":     st.task.Enabled,
-			"nextRun":     st.nextRun.Format(time.RFC3339),
-			"schedule":    st.task.Schedule,
+			"id":        st.task.ID,
+			"name":      st.task.Name,
+			"projectId": st.task.ProjectID,
+			"enabled":   st.task.Enabled,
+			"nextRun":   st.nextRun.Format(time.RFC3339),
+			"schedule":  st.task.Schedule,
 		})
 	}
 	return result
