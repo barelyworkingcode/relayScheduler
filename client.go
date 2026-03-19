@@ -92,7 +92,7 @@ func (c *LLMClient) SendMessage(sessionID, text string) (*MessageResponse, error
 }
 
 func (c *LLMClient) EndSession(sessionID string) {
-	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/api/sessions/%s", c.baseURL, sessionID), nil)
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/sessions/%s/stop", c.baseURL, sessionID), nil)
 	if err != nil {
 		return
 	}

@@ -178,6 +178,9 @@ func (s *Scheduler) executeTask(task Task) {
 
 	exec.SessionID = session.SessionID
 
+	// Persist session ID immediately so page refreshes get the right value.
+	s.store.SetLastSessionID(task.ID, session.SessionID)
+
 	// Broadcast task_started now that we have a sessionId.
 	s.hub.Broadcast(map[string]string{
 		"type":      "task_started",
@@ -208,9 +211,8 @@ func (s *Scheduler) executeTask(task Task) {
 	// Log the execution.
 	s.logStore.Log(task.ProjectID, task.ID, exec)
 
-	// Update last run status and session ID in store.
+	// Update last run status in store.
 	s.store.SetLastRun(task.ID, exec.Status)
-	s.store.SetLastSessionID(task.ID, session.SessionID)
 
 	// Broadcast completion or error.
 	if exec.Status == "error" {
