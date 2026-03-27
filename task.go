@@ -16,6 +16,7 @@ type Task struct {
 	LastRun   string          `json:"lastRun,omitempty"`
 	LastStatus    string `json:"lastStatus,omitempty"` // "success", "error", ""
 	LastSessionID string `json:"lastSessionId,omitempty"`
+	CatchUp       bool   `json:"catchUp"` // Run missed executions after sleep/wake
 }
 
 // Schedule types parsed from the schedule JSON.

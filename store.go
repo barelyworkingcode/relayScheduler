@@ -58,12 +58,13 @@ func (s *TaskStore) writeLocked(tasks []Task) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0600)
-}
-
-// List returns all tasks.
-func (s *TaskStore) List() ([]Task, error) {
-	return s.Load()
+	// Atomic write: write to temp file then rename, so a crash mid-write
+	// cannot corrupt tasks.json.
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 // ListByProject returns tasks filtered by project ID.
@@ -213,72 +214,47 @@ func (s *TaskStore) DeleteByProject(projectID string) (int, error) {
 	return deleted, nil
 }
 
-// SetLastRun updates the LastRun and LastStatus for a task (called after execution).
-func (s *TaskStore) SetLastRun(id, status string) {
+// updateTask is a shared helper for lock/read/find/mutate/write operations.
+func (s *TaskStore) updateTask(id string, fn func(*Task)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	tasks, err := s.readLocked()
 	if err != nil {
-		slog.Error("failed to read tasks for last-run update", "error", err)
+		slog.Error("failed to read tasks for update", "id", id, "error", err)
 		return
 	}
 
 	for i, t := range tasks {
 		if t.ID == id {
-			tasks[i].LastRun = time.Now().UTC().Format(time.RFC3339)
-			tasks[i].LastStatus = status
-			tasks[i].UpdatedAt = tasks[i].LastRun
+			fn(&tasks[i])
+			tasks[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 			if err := s.writeLocked(tasks); err != nil {
-				slog.Error("failed to write last-run update", "error", err)
+				slog.Error("failed to write task update", "id", id, "error", err)
 			}
 			return
 		}
 	}
+}
+
+// SetLastRun updates the LastRun and LastStatus for a task (called after execution).
+func (s *TaskStore) SetLastRun(id, status string) {
+	s.updateTask(id, func(t *Task) {
+		t.LastRun = time.Now().UTC().Format(time.RFC3339)
+		t.LastStatus = status
+	})
 }
 
 // SetLastSessionID updates the LastSessionID for a task.
 func (s *TaskStore) SetLastSessionID(id, sessionID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tasks, err := s.readLocked()
-	if err != nil {
-		slog.Error("failed to read tasks for session-id update", "error", err)
-		return
-	}
-
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].LastSessionID = sessionID
-			tasks[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-			if err := s.writeLocked(tasks); err != nil {
-				slog.Error("failed to write session-id update", "error", err)
-			}
-			return
-		}
-	}
+	s.updateTask(id, func(t *Task) {
+		t.LastSessionID = sessionID
+	})
 }
 
 // SetEnabled updates the Enabled flag for a task.
 func (s *TaskStore) SetEnabled(id string, enabled bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tasks, err := s.readLocked()
-	if err != nil {
-		slog.Error("failed to read tasks for enabled update", "error", err)
-		return
-	}
-
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].Enabled = enabled
-			tasks[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-			if err := s.writeLocked(tasks); err != nil {
-				slog.Error("failed to write enabled update", "error", err)
-			}
-			return
-		}
-	}
+	s.updateTask(id, func(t *Task) {
+		t.Enabled = enabled
+	})
 }

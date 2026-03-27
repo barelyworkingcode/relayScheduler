@@ -46,8 +46,14 @@ func (s *LogStore) Log(projectID, taskID string, exec Execution) {
 		return
 	}
 
-	if err := os.WriteFile(s.logPath(projectID, taskID), data, 0600); err != nil {
+	path := s.logPath(projectID, taskID)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		slog.Error("failed to write log", "error", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		slog.Error("failed to rename log", "error", err)
 	}
 }
 

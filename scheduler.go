@@ -1,19 +1,27 @@
 package main
 
 import (
-	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 )
 
+var (
+	ErrTaskNotFound = errors.New("task not found")
+	ErrTaskRunning  = errors.New("task is already running")
+)
+
 type scheduledTask struct {
 	task    Task
-	timer   *time.Timer
 	nextRun time.Time
 }
 
-// Scheduler manages task timers and executes tasks via the LLM client.
+// Scheduler manages task scheduling via a wall-clock ticker and executes
+// tasks via the LLM client. The ticker approach is resilient to macOS sleep
+// because each tick checks the real wall clock rather than relying on
+// monotonic-clock timers.
 type Scheduler struct {
 	mu       sync.Mutex
 	client   *LLMClient
@@ -21,7 +29,8 @@ type Scheduler struct {
 	logStore *LogStore
 	hub      *Hub
 	tasks    map[string]*scheduledTask // key: taskID
-	running  bool
+	running  map[string]struct{}       // taskIDs currently executing
+	done     chan struct{}
 }
 
 func NewScheduler(client *LLMClient, store *TaskStore, logStore *LogStore, hub *Hub) *Scheduler {
@@ -31,7 +40,90 @@ func NewScheduler(client *LLMClient, store *TaskStore, logStore *LogStore, hub *
 		logStore: logStore,
 		hub:      hub,
 		tasks:    make(map[string]*scheduledTask),
-		running:  true,
+		running:  make(map[string]struct{}),
+		done:     make(chan struct{}),
+	}
+}
+
+// Start begins the wall-clock ticker loop. Call after LoadAllTasks.
+func (s *Scheduler) Start() {
+	go s.tickLoop()
+}
+
+func (s *Scheduler) tickLoop() {
+	// Check immediately on start for any already-due tasks.
+	s.checkAndFireTasks()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.checkAndFireTasks()
+		}
+	}
+}
+
+const missedThreshold = 10 * time.Minute
+
+func (s *Scheduler) checkAndFireTasks() {
+	now := time.Now()
+
+	s.mu.Lock()
+	var toFire []Task
+	var toReschedule []Task
+
+	for _, st := range s.tasks {
+		if !now.Before(st.nextRun) { // nextRun <= now
+			if _, ok := s.running[st.task.ID]; ok {
+				continue // already executing (e.g. manual trigger)
+			}
+			overdue := now.Sub(st.nextRun)
+			if !st.task.CatchUp && overdue > missedThreshold {
+				// Missed and catch-up disabled: skip, reschedule for next occurrence.
+				toReschedule = append(toReschedule, st.task)
+			} else {
+				toFire = append(toFire, st.task)
+			}
+		}
+	}
+
+	// Remove fired/rescheduled tasks from the map.
+	// rescheduleOrDisable (for fired) and scheduleTaskLocked (for skipped)
+	// will re-add them with the next nextRun.
+	for _, task := range toFire {
+		delete(s.tasks, task.ID)
+	}
+	for _, task := range toReschedule {
+		delete(s.tasks, task.ID)
+	}
+
+	// Reschedule skipped tasks while still under lock.
+	for _, task := range toReschedule {
+		slog.Info("skipping missed task (catch-up disabled)", "task", task.Name)
+		s.scheduleTaskLocked(task)
+	}
+	for _, task := range toFire {
+		s.running[task.ID] = struct{}{}
+	}
+	s.mu.Unlock()
+
+	// Execute each due task in its own goroutine.
+	for _, task := range toFire {
+		taskCopy := task
+		go s.executeTask(taskCopy)
+	}
+}
+
+func (s *Scheduler) isStopped() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -45,10 +137,6 @@ func (s *Scheduler) LoadAllTasks() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Cancel existing timers.
-	for _, st := range s.tasks {
-		st.timer.Stop()
-	}
 	s.tasks = make(map[string]*scheduledTask)
 
 	for _, task := range tasks {
@@ -72,11 +160,7 @@ func (s *Scheduler) ScheduleTask(task Task) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Cancel existing timer if any.
-	if st, ok := s.tasks[task.ID]; ok {
-		st.timer.Stop()
-		delete(s.tasks, task.ID)
-	}
+	delete(s.tasks, task.ID)
 
 	if !task.Enabled {
 		return
@@ -85,57 +169,52 @@ func (s *Scheduler) ScheduleTask(task Task) {
 	s.scheduleTaskLocked(task)
 }
 
-// UnscheduleTask cancels the timer for a task.
+// UnscheduleTask removes a task from the schedule.
 func (s *Scheduler) UnscheduleTask(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if st, ok := s.tasks[taskID]; ok {
-		st.timer.Stop()
-		delete(s.tasks, taskID)
-	}
+	delete(s.tasks, taskID)
 }
 
-// UnscheduleByProject cancels all timers for tasks belonging to a project.
+// UnscheduleByProject removes all tasks for a project from the schedule.
 func (s *Scheduler) UnscheduleByProject(projectID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for id, st := range s.tasks {
 		if st.task.ProjectID == projectID {
-			st.timer.Stop()
 			delete(s.tasks, id)
 		}
 	}
 }
 
 func (s *Scheduler) scheduleTaskLocked(task Task) {
+	// on_demand tasks only run via RunTaskNow; never auto-schedule them.
+	st, _ := ScheduleType(task.Schedule)
+	if st == "on_demand" {
+		return
+	}
+
 	nextRun, err := CalculateNextRun(task.Schedule)
 	if err != nil {
 		slog.Error("failed to calculate next run", "task", task.Name, "error", err)
 		return
 	}
 
-	delay := time.Until(nextRun)
-	if delay < 0 {
-		delay = 0
-	}
-
-	taskCopy := task
-	st := &scheduledTask{
-		task:    taskCopy,
+	s.tasks[task.ID] = &scheduledTask{
+		task:    task,
 		nextRun: nextRun,
 	}
-
-	st.timer = time.AfterFunc(delay, func() {
-		s.executeTask(taskCopy)
-	})
-
-	s.tasks[task.ID] = st
-	slog.Info("scheduled task", "task", task.Name, "nextRun", nextRun.Format(time.RFC3339))
+	slog.Info("scheduled task", "task", task.Name, "nextRun", nextRun.UTC().Format(time.RFC3339))
 }
 
 func (s *Scheduler) executeTask(task Task) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.running, task.ID)
+		s.mu.Unlock()
+	}()
+
 	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID)
 
 	// End previous session if one exists (one live session per task max).
@@ -239,13 +318,17 @@ func (s *Scheduler) executeTask(task Task) {
 }
 
 func (s *Scheduler) rescheduleOrDisable(task Task) {
-	// For once/immediate: disable instead of rescheduling.
-	var base struct {
-		Type string `json:"type"`
+	// Re-read from store to get the latest version. The task may have been
+	// updated, deleted, or disabled via API during execution.
+	current, err := s.store.Get(task.ID)
+	if err != nil || current == nil || !current.Enabled {
+		return
 	}
-	json.Unmarshal(task.Schedule, &base)
+	task = *current
 
-	if base.Type == "once" || base.Type == "on_demand" {
+	st, _ := ScheduleType(task.Schedule)
+
+	if st == "once" {
 		s.store.SetEnabled(task.ID, false)
 		s.mu.Lock()
 		delete(s.tasks, task.ID)
@@ -254,21 +337,24 @@ func (s *Scheduler) rescheduleOrDisable(task Task) {
 		return
 	}
 
+	if st == "on_demand" {
+		// on_demand tasks stay enabled; they only run via RunTaskNow.
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running {
+	if !s.isStopped() {
 		s.scheduleTaskLocked(task)
 	}
 }
 
-// Stop cancels all scheduled tasks.
+// Stop cancels all scheduled tasks and stops the ticker.
 func (s *Scheduler) Stop() {
+	close(s.done)
 	s.mu.Lock()
-	s.running = false
-	for _, st := range s.tasks {
-		st.timer.Stop()
-	}
 	s.tasks = make(map[string]*scheduledTask)
+	s.running = make(map[string]struct{})
 	s.mu.Unlock()
 }
 
@@ -279,28 +365,18 @@ func (s *Scheduler) RunTaskNow(taskID string) error {
 		return err
 	}
 	if task == nil {
-		slog.Error("task not found for manual run", "taskId", taskID)
-		return nil
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
 	}
+
+	s.mu.Lock()
+	if _, ok := s.running[taskID]; ok {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrTaskRunning, taskID)
+	}
+	s.running[taskID] = struct{}{}
+	s.mu.Unlock()
+
 	go s.executeTask(*task)
 	return nil
 }
 
-// GetAllTasks returns all scheduled tasks with their next run times.
-func (s *Scheduler) GetAllTasks() []map[string]interface{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result := make([]map[string]interface{}, 0)
-	for _, st := range s.tasks {
-		result = append(result, map[string]interface{}{
-			"id":        st.task.ID,
-			"name":      st.task.Name,
-			"projectId": st.task.ProjectID,
-			"enabled":   st.task.Enabled,
-			"nextRun":   st.nextRun.Format(time.RFC3339),
-			"schedule":  st.task.Schedule,
-		})
-	}
-	return result
-}

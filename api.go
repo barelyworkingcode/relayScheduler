@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -29,7 +30,7 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 			if projectID != "" {
 				tasks, err = store.ListByProject(projectID)
 			} else {
-				tasks, err = store.List()
+				tasks, err = store.Load()
 			}
 			if err != nil {
 				writeError(w, 500, err.Error())
@@ -48,6 +49,10 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 			}
 			if task.Name == "" || task.Prompt == "" || task.ProjectID == "" || len(task.Schedule) == 0 {
 				writeError(w, 400, "name, prompt, projectId, and schedule are required")
+				return
+			}
+			if err := ValidateSchedule(task.Schedule); err != nil {
+				writeError(w, 400, "invalid schedule: "+err.Error())
 				return
 			}
 			created, err := store.Create(task)
@@ -125,7 +130,13 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 					return
 				}
 				if err := scheduler.RunTaskNow(taskID); err != nil {
-					writeError(w, 500, err.Error())
+					if errors.Is(err, ErrTaskRunning) {
+						writeError(w, 409, err.Error())
+					} else if errors.Is(err, ErrTaskNotFound) {
+						writeError(w, 404, err.Error())
+					} else {
+						writeError(w, 500, err.Error())
+					}
 					return
 				}
 				writeJSON(w, 200, map[string]interface{}{
@@ -158,6 +169,12 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 			if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
 				writeError(w, 400, "invalid JSON: "+err.Error())
 				return
+			}
+			if len(updated.Schedule) > 0 {
+				if err := ValidateSchedule(updated.Schedule); err != nil {
+					writeError(w, 400, "invalid schedule: "+err.Error())
+					return
+				}
 			}
 			task, err := store.Update(taskID, updated)
 			if err != nil {

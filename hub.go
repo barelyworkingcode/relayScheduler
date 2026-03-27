@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+const writeWait = 10 * time.Second
 
 // Hub manages WebSocket connections and broadcasts task events to all clients.
 type Hub struct {
@@ -47,6 +50,7 @@ func (h *Hub) Broadcast(msg interface{}) {
 	defer h.mu.Unlock()
 
 	for conn := range h.clients {
+		conn.SetWriteDeadline(time.Now().Add(writeWait))
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			slog.Warn("hub: write failed, removing client", "error", err)
 			conn.Close()
@@ -91,5 +95,9 @@ func (h *Hub) SendStatus(conn *websocket.Conn) {
 	if err != nil {
 		return
 	}
+
+	h.mu.Lock()
+	conn.SetWriteDeadline(time.Now().Add(writeWait))
 	conn.WriteMessage(websocket.TextMessage, data)
+	h.mu.Unlock()
 }

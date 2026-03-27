@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -30,6 +31,8 @@ func main() {
 	}
 
 	slog.Info("starting relayScheduler", "llmURL", *llmURL, "dataDir", *dataDir)
+	zone, offset := time.Now().Zone()
+	slog.Info("system timezone", "zone", zone, "offsetSeconds", offset)
 
 	client := NewLLMClient(*llmURL)
 	store := NewTaskStore(*dataDir)
@@ -37,10 +40,11 @@ func main() {
 	hub := NewHub(store)
 	scheduler := NewScheduler(client, store, logStore, hub)
 
-	// Load tasks from store and schedule them.
+	// Load tasks from store and start the wall-clock ticker.
 	if err := scheduler.LoadAllTasks(); err != nil {
 		slog.Error("failed to load tasks", "error", err)
 	}
+	scheduler.Start()
 
 	// HTTP API.
 	mux := http.NewServeMux()
