@@ -13,7 +13,9 @@ import (
 )
 
 func main() {
-	llmURL := flag.String("llm-url", envOrDefault("RELAY_LLM_URL", "http://localhost:3001"), "relayLLM base URL")
+	relayURL := flag.String("relay-url", envOrDefault("RELAY_FRONTEND_URL", "http://localhost:3000"), "relay HTTP base URL (used only when --relay-socket is empty)")
+	relaySocket := flag.String("relay-socket", envOrDefault("RELAY_FRONTEND_SOCKET", ""), "relay frontend Unix socket path (preferred when running under the relay orchestrator)")
+	relayToken := flag.String("relay-token", envOrDefault("RELAY_FRONTEND_TOKEN", ""), "Bearer token for relay's frontend API")
 	dataDir := flag.String("data-dir", envOrDefault("RELAY_SCHEDULER_DATA", ""), "Data directory for tasks and logs")
 	port := flag.String("port", envOrDefault("RELAY_SCHEDULER_PORT", "3002"), "HTTP API listen port")
 	flag.Parse()
@@ -30,11 +32,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("starting relayScheduler", "llmURL", *llmURL, "dataDir", *dataDir)
+	slog.Info("starting relayScheduler",
+		"relayURL", *relayURL,
+		"relaySocket", *relaySocket,
+		"dataDir", *dataDir)
 	zone, offset := time.Now().Zone()
 	slog.Info("system timezone", "zone", zone, "offsetSeconds", offset)
 
-	client := NewLLMClient(*llmURL)
+	client := NewLLMClient(*relayURL, *relaySocket, *relayToken)
 	store := NewTaskStore(*dataDir)
 	logStore := NewLogStore(filepath.Join(*dataDir, "task-logs"))
 	hub := NewHub(store)

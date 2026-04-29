@@ -235,8 +235,29 @@ func (s *Scheduler) executeTask(task Task) {
 
 	model := task.Model
 
-	// Create a headless session via relayLLM.
-	session, err := s.client.CreateSession(task.ProjectID, model, task.Name)
+	// Resolve the project so we can pass `directory` and `mcpToken` to relayLLM
+	// — relayLLM is a pure execution engine and has no project awareness.
+	project, err := s.client.GetProject(task.ProjectID)
+	if err != nil {
+		exec.Status = "error"
+		exec.Error = err.Error()
+		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		slog.Error("task project lookup failed", "task", task.Name, "error", err)
+		s.logStore.Log(task.ProjectID, task.ID, exec)
+		s.store.SetLastRun(task.ID, "error")
+		s.hub.Broadcast(map[string]string{
+			"type":      "task_error",
+			"taskId":    task.ID,
+			"projectId": task.ProjectID,
+			"taskName":  task.Name,
+			"error":     err.Error(),
+		})
+		s.rescheduleOrDisable(task)
+		return
+	}
+
+	// Create a headless session via relayLLM (proxied through relay).
+	session, err := s.client.CreateSession(project, model, task.Name)
 	if err != nil {
 		exec.Status = "error"
 		exec.Error = err.Error()
