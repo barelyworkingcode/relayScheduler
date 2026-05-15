@@ -3,9 +3,39 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 )
+
+// validateTaskFields enforces per-SessionType required fields for task
+// creation. Chat tasks need Prompt; PTY tasks need TemplateID. The empty
+// SessionType is treated as "headless" for backward compatibility with
+// pre-PTY task records.
+func validateTaskFields(task Task) error {
+	if task.Name == "" {
+		return errors.New("name is required")
+	}
+	if task.ProjectID == "" {
+		return errors.New("projectId is required")
+	}
+	if len(task.Schedule) == 0 {
+		return errors.New("schedule is required")
+	}
+	switch task.SessionType {
+	case SessionTypePTY:
+		if task.TemplateID == "" {
+			return errors.New("templateId is required for PTY tasks")
+		}
+	case "", SessionTypeChat:
+		if task.Prompt == "" {
+			return errors.New("prompt is required for chat tasks")
+		}
+	default:
+		return fmt.Errorf("invalid sessionType %q (expected \"headless\" or \"pty\")", task.SessionType)
+	}
+	return nil
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -47,8 +77,8 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 				writeError(w, 400, "invalid JSON: "+err.Error())
 				return
 			}
-			if task.Name == "" || task.Prompt == "" || task.ProjectID == "" || len(task.Schedule) == 0 {
-				writeError(w, 400, "name, prompt, projectId, and schedule are required")
+			if err := validateTaskFields(task); err != nil {
+				writeError(w, 400, err.Error())
 				return
 			}
 			if err := ValidateSchedule(task.Schedule); err != nil {

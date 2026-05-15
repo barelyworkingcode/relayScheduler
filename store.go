@@ -149,6 +149,9 @@ func (s *TaskStore) Update(id string, updated Task) (*Task, error) {
 			if updated.LastSessionID == "" {
 				updated.LastSessionID = t.LastSessionID
 			}
+			if updated.LastTerminalID == "" {
+				updated.LastTerminalID = t.LastTerminalID
+			}
 			tasks[i] = updated
 			if err := s.writeLocked(tasks); err != nil {
 				return nil, err
@@ -249,6 +252,15 @@ func (s *TaskStore) SetLastRun(id, status string) {
 func (s *TaskStore) SetLastSessionID(id, sessionID string) {
 	s.updateTask(id, func(t *Task) {
 		t.LastSessionID = sessionID
+	})
+}
+
+// SetLastTerminalID updates the LastTerminalID for a PTY task. Eve uses
+// this to wire the "View Last Run" click on a terminal task to the read-only
+// PTY viewer.
+func (s *TaskStore) SetLastTerminalID(id, terminalID string) {
+	s.updateTask(id, func(t *Task) {
+		t.LastTerminalID = terminalID
 	})
 }
 

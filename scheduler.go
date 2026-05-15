@@ -215,11 +215,22 @@ func (s *Scheduler) executeTask(task Task) {
 		s.mu.Unlock()
 	}()
 
-	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID)
+	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID, "sessionType", task.SessionType)
 
 	// End previous session if one exists (one live session per task max).
-	if current, err := s.store.Get(task.ID); err == nil && current != nil && current.LastSessionID != "" {
-		s.client.EndSession(current.LastSessionID)
+	// Dispatches by SessionType so a PTY task closes its previous terminal
+	// rather than trying to /stop a non-existent chat session.
+	if current, err := s.store.Get(task.ID); err == nil && current != nil {
+		switch current.SessionType {
+		case SessionTypePTY:
+			if current.LastTerminalID != "" {
+				s.client.CloseTerminal(current.LastTerminalID)
+			}
+		default:
+			if current.LastSessionID != "" {
+				s.client.EndSession(current.LastSessionID)
+			}
+		}
 	}
 
 	exec := Execution{
@@ -245,14 +256,14 @@ func (s *Scheduler) executeTask(task Task) {
 		slog.Error("task project lookup failed", "task", task.Name, "error", err)
 		s.logStore.Log(task.ProjectID, task.ID, exec)
 		s.store.SetLastRun(task.ID, "error")
-		s.hub.Broadcast(map[string]string{
-			"type":      "task_error",
-			"taskId":    task.ID,
-			"projectId": task.ProjectID,
-			"taskName":  task.Name,
-			"error":     err.Error(),
-		})
+		s.broadcastTaskEvent("task_error", task, "", map[string]interface{}{"error": err.Error()})
 		s.rescheduleOrDisable(task)
+		return
+	}
+
+	// PTY tasks take a different path — no LLM session, just a terminal.
+	if task.SessionType == SessionTypePTY {
+		s.runPtyTask(task, project, exec)
 		return
 	}
 
@@ -265,13 +276,7 @@ func (s *Scheduler) executeTask(task Task) {
 		slog.Error("task session creation failed", "task", task.Name, "error", err)
 		s.logStore.Log(task.ProjectID, task.ID, exec)
 		s.store.SetLastRun(task.ID, "error")
-		s.hub.Broadcast(map[string]string{
-			"type":      "task_error",
-			"taskId":    task.ID,
-			"projectId": task.ProjectID,
-			"taskName":  task.Name,
-			"error":     err.Error(),
-		})
+		s.broadcastTaskEvent("task_error", task, "", map[string]interface{}{"error": err.Error()})
 		s.rescheduleOrDisable(task)
 		return
 	}
@@ -281,14 +286,7 @@ func (s *Scheduler) executeTask(task Task) {
 	// Persist session ID immediately so page refreshes get the right value.
 	s.store.SetLastSessionID(task.ID, session.SessionID)
 
-	// Broadcast task_started now that we have a sessionId.
-	s.hub.Broadcast(map[string]string{
-		"type":      "task_started",
-		"taskId":    task.ID,
-		"projectId": task.ProjectID,
-		"taskName":  task.Name,
-		"sessionId": session.SessionID,
-	})
+	s.broadcastTaskEvent("task_started", task, session.SessionID, nil)
 
 	// Send the prompt and wait for the response.
 	result, err := s.client.SendMessage(session.SessionID, task.Prompt)
@@ -314,24 +312,10 @@ func (s *Scheduler) executeTask(task Task) {
 	// Update last run status in store.
 	s.store.SetLastRun(task.ID, exec.Status)
 
-	// Broadcast completion or error.
 	if exec.Status == "error" {
-		s.hub.Broadcast(map[string]string{
-			"type":      "task_error",
-			"taskId":    task.ID,
-			"projectId": task.ProjectID,
-			"taskName":  task.Name,
-			"error":     exec.Error,
-		})
+		s.broadcastTaskEvent("task_error", task, session.SessionID, map[string]interface{}{"error": exec.Error})
 	} else {
-		s.hub.Broadcast(map[string]interface{}{
-			"type":      "task_completed",
-			"taskId":    task.ID,
-			"projectId": task.ProjectID,
-			"taskName":  task.Name,
-			"sessionId": session.SessionID,
-			"status":    exec.Status,
-		})
+		s.broadcastTaskEvent("task_completed", task, session.SessionID, map[string]interface{}{"status": exec.Status})
 	}
 
 	// Reschedule or disable.
@@ -377,6 +361,132 @@ func (s *Scheduler) Stop() {
 	s.tasks = make(map[string]*scheduledTask)
 	s.running = make(map[string]struct{})
 	s.mu.Unlock()
+}
+
+// defaultPtyTimeout is the wall-clock cap applied when a PTY task does not
+// set MaxDurationSeconds. Long-running daemons must opt in via that field.
+const defaultPtyTimeout = 30 * time.Minute
+
+// broadcastTaskEvent sends a task lifecycle WS event with the standard
+// envelope (type, taskId, projectId, taskName, view). Extras are merged in
+// for event-specific fields like `status`, `error`, `exitCode`. Use the
+// helper instead of hand-building the map so the view envelope stays
+// consistent across every broadcast site.
+func (s *Scheduler) broadcastTaskEvent(eventType string, task Task, runID string, extra map[string]interface{}) {
+	msg := map[string]interface{}{
+		"type":      eventType,
+		"taskId":    task.ID,
+		"projectId": task.ProjectID,
+		"taskName":  task.Name,
+		"view":      taskView(task, runID),
+	}
+	for k, v := range extra {
+		msg[k] = v
+	}
+	s.hub.Broadcast(msg)
+}
+
+// runPtyTask is the PTY-mode mirror of the chat path. It launches a terminal
+// session on relayLLM, attaches via WS to learn the exit code, captures the
+// log tail for the execution record, and logs/broadcasts completion.
+//
+// The starting `exec` already has TaskID/TaskName/ProjectID/StartedAt set
+// and Status="running" from executeTask.
+func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
+	if task.TemplateID == "" {
+		s.failPtyTask(task, exec, "PTY task missing templateId", ExitCodeCreateFailed)
+		return
+	}
+
+	directory := project.Path
+	if task.Directory != "" {
+		directory = task.Directory
+	}
+	// CreateTerminal pulls Directory from project.Path; honor the per-task
+	// override by passing a shallow copy with Path adjusted.
+	projectForTerminal := *project
+	projectForTerminal.Path = directory
+
+	term, err := s.client.CreateTerminal(&projectForTerminal, task.TemplateID, task.Name, task.ExtraArgs)
+	if err != nil {
+		s.failPtyTask(task, exec, err.Error(), ExitCodeCreateFailed)
+		return
+	}
+
+	exec.TerminalID = term.ID
+	s.store.SetLastTerminalID(task.ID, term.ID)
+
+	s.broadcastTaskEvent("task_started", task, term.ID, nil)
+
+	timeout := time.Duration(task.MaxDurationSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = defaultPtyTimeout
+	}
+
+	exitCode, attachErr := s.client.AttachTerminalAndWait(term.ID, timeout)
+	exec.ExitCode = &exitCode
+	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+
+	// On timeout the PTY is still alive — reap it before reading the log,
+	// otherwise the child can keep writing bytes during the read and we'd
+	// capture a racy/partial snapshot.
+	if exitCode == ExitCodeTimeout {
+		s.client.CloseTerminal(term.ID)
+	}
+
+	// Log preview for the execution record. Eve renders the full stream
+	// via /api/terminals/{id}/log; this is just a quick glance for the
+	// history list. Best-effort: never fail the run on a read error.
+	if logBytes, lerr := s.client.GetTerminalLog(term.ID); lerr == nil {
+		const maxPreview = 16 * 1024
+		if len(logBytes) > maxPreview {
+			logBytes = logBytes[len(logBytes)-maxPreview:]
+		}
+		exec.Response = string(logBytes)
+	}
+
+	switch {
+	case exitCode == ExitCodeTimeout:
+		exec.Status = "timeout"
+		exec.Error = "task exceeded maxDurationSeconds"
+	case exitCode < 0:
+		exec.Status = "error"
+		if attachErr != nil {
+			exec.Error = attachErr.Error()
+		}
+	case exitCode == 0:
+		exec.Status = "success"
+	default:
+		exec.Status = "error"
+		exec.Error = fmt.Sprintf("process exited with code %d", exitCode)
+	}
+
+	s.logStore.Log(task.ProjectID, task.ID, exec)
+	s.store.SetLastRun(task.ID, exec.Status)
+
+	extra := map[string]interface{}{"status": exec.Status, "exitCode": exitCode}
+	if exec.Status == "success" {
+		s.broadcastTaskEvent("task_completed", task, term.ID, extra)
+	} else {
+		extra["error"] = exec.Error
+		s.broadcastTaskEvent("task_error", task, term.ID, extra)
+	}
+
+	s.rescheduleOrDisable(task)
+}
+
+// failPtyTask records a PTY-mode failure that occurred before the WS attach
+// (typically template missing or POST /api/terminals returned an error).
+func (s *Scheduler) failPtyTask(task Task, exec Execution, msg string, exitCode int) {
+	exec.Status = "error"
+	exec.Error = msg
+	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	exec.ExitCode = &exitCode
+	slog.Error("pty task failed", "task", task.Name, "error", msg)
+	s.logStore.Log(task.ProjectID, task.ID, exec)
+	s.store.SetLastRun(task.ID, "error")
+	s.broadcastTaskEvent("task_error", task, "", map[string]interface{}{"error": msg, "exitCode": exitCode})
+	s.rescheduleOrDisable(task)
 }
 
 // RunTaskNow executes a task immediately, bypassing the schedule.

@@ -8,16 +8,29 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+// Synthetic exit codes the scheduler emits when the PTY didn't actually
+// produce one. Real process exits use 0..255; negative values are reserved
+// for scheduler-side conditions. Documented in plans/well-lets-think-more-rippling-dongarra.md.
+const (
+	ExitCodeSessionLost  = -1 // WS dropped, relayLLM restart, or "terminal not found"
+	ExitCodeTimeout      = -2 // MaxDurationSeconds elapsed
+	ExitCodeCreateFailed = -3 // POST /api/terminals failed
 )
 
 // LLMClient communicates with relay's HTTP API. After the front-door
 // migration, the scheduler talks only to relay (over a Unix socket); relay
 // reverse-proxies session traffic to relayLLM internally.
 type LLMClient struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL    string
+	token      string
+	http       *http.Client
+	socketPath string // empty when using TCP; non-empty when dialing a Unix socket
 }
 
 // Project mirrors the snake_case shape relay returns from /api/projects/{id}.
@@ -63,9 +76,10 @@ func NewLLMClient(baseURL, socketPath, token string) *LLMClient {
 		baseURL = "http://relay-frontend.localsocket"
 	}
 	return &LLMClient{
-		baseURL: baseURL,
-		token:   token,
-		http:    &http.Client{Timeout: 10 * time.Minute, Transport: transport},
+		baseURL:    baseURL,
+		token:      token,
+		http:       &http.Client{Timeout: 10 * time.Minute, Transport: transport},
+		socketPath: socketPath,
 	}
 }
 
@@ -178,4 +192,176 @@ func (c *LLMClient) EndSession(sessionID string) {
 		return
 	}
 	resp.Body.Close()
+}
+
+// --- Terminal/PTY methods ---
+
+// TerminalResponse mirrors the response from POST /api/terminals.
+type TerminalResponse struct {
+	ID         string `json:"id"`
+	TemplateID string `json:"templateId"`
+	Name       string `json:"name"`
+	Directory  string `json:"directory"`
+	State      string `json:"state"`
+}
+
+// CreateTerminal launches a PTY session on relayLLM with the given template
+// and per-task extra args. The terminal's directory defaults to project.Path.
+// On success, the returned ID is what callers persist on the Task and use
+// for AttachTerminalAndWait / GetTerminalLog / CloseTerminal.
+func (c *LLMClient) CreateTerminal(project *Project, templateID, name string, extraArgs []string) (*TerminalResponse, error) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"templateId": templateID,
+		"name":       name,
+		"directory":  project.Path,
+		"cols":       120,
+		"rows":       30,
+		"extraArgs":  extraArgs,
+	})
+
+	req, err := c.newRequest(http.MethodPost, "/api/terminals", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("create terminal: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("create terminal failed (%d): %s", resp.StatusCode, body)
+	}
+
+	var out TerminalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetTerminalLog returns the stitched head+tail bytes of the PTY's output.
+// Works even after the in-memory session has been evicted, as long as the
+// log files have not been swept.
+func (c *LLMClient) GetTerminalLog(terminalID string) ([]byte, error) {
+	req, err := c.newRequest(http.MethodGet, fmt.Sprintf("/api/terminals/%s/log", terminalID), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get terminal log: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get terminal log failed (%d): %s", resp.StatusCode, body)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// CloseTerminal kills a PTY session. Best-effort: errors are swallowed
+// because cleanup is non-critical (idle timeout would eventually GC it).
+func (c *LLMClient) CloseTerminal(terminalID string) {
+	req, err := c.newRequest(http.MethodDelete, "/api/terminals/"+terminalID, nil)
+	if err != nil {
+		return
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+// AttachTerminalAndWait opens a WebSocket to relay's /ws endpoint, joins the
+// terminal, and blocks until either:
+//
+//   - terminal_exit arrives → returns the real exit code (0..255).
+//   - timeout elapses → returns ExitCodeTimeout (-2).
+//   - WS error / close / "terminal not found" → returns ExitCodeSessionLost (-1).
+//
+// The scheduler does not buffer terminal_output frames — they are persisted
+// on the relayLLM side by terminalLogger. This WS attach exists purely to
+// learn the exit code reliably.
+func (c *LLMClient) AttachTerminalAndWait(terminalID string, timeout time.Duration) (int, error) {
+	conn, err := c.dialWS("/ws")
+	if err != nil {
+		return ExitCodeSessionLost, fmt.Errorf("dial ws: %w", err)
+	}
+	defer conn.Close()
+
+	joinMsg, _ := json.Marshal(map[string]string{
+		"type":       "join_terminal",
+		"terminalId": terminalID,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, joinMsg); err != nil {
+		return ExitCodeSessionLost, fmt.Errorf("send join_terminal: %w", err)
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ExitCodeTimeout, fmt.Errorf("timeout after %s", timeout)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(remaining)); err != nil {
+			return ExitCodeSessionLost, fmt.Errorf("set read deadline: %w", err)
+		}
+
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			// net.Error.Timeout() distinguishes our wall-clock cap from a
+			// real connection drop. Either way the run is over.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return ExitCodeTimeout, fmt.Errorf("timeout after %s", timeout)
+			}
+			return ExitCodeSessionLost, fmt.Errorf("ws read: %w", err)
+		}
+
+		var frame struct {
+			Type     string `json:"type"`
+			ExitCode int    `json:"exitCode"`
+			Message  string `json:"message"`
+		}
+		if err := json.Unmarshal(msg, &frame); err != nil {
+			continue // unparseable frame — ignore and keep reading.
+		}
+
+		switch frame.Type {
+		case "terminal_exit":
+			return frame.ExitCode, nil
+		case "error":
+			// "terminal not found" means the in-memory session is gone
+			// (relayLLM restart or idle GC) before we could attach.
+			if strings.Contains(frame.Message, "terminal not found") {
+				return ExitCodeSessionLost, fmt.Errorf("session lost: %s", frame.Message)
+			}
+			return ExitCodeSessionLost, fmt.Errorf("ws error: %s", frame.Message)
+		}
+		// terminal_joined, terminal_output, etc. — keep reading.
+	}
+}
+
+// dialWS opens a WebSocket to relay's /ws endpoint, using the same Unix
+// socket the HTTP client uses when configured, and sending the bearer token.
+func (c *LLMClient) dialWS(path string) (*websocket.Conn, error) {
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	if c.socketPath != "" {
+		dialer.NetDial = func(_, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).Dial("unix", c.socketPath)
+		}
+	}
+	// http://… → ws://… and https://… → wss://…
+	wsURL := strings.Replace(c.baseURL, "http", "ws", 1) + path
+	headers := http.Header{}
+	if c.token != "" {
+		headers.Set("Authorization", "Bearer "+c.token)
+	}
+	conn, _, err := dialer.Dial(wsURL, headers)
+	return conn, err
 }

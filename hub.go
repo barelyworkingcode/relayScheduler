@@ -68,22 +68,27 @@ func (h *Hub) SendStatus(conn *websocket.Conn) {
 	}
 
 	type runningTask struct {
-		TaskID    string `json:"taskId"`
-		ProjectID string `json:"projectId"`
-		TaskName  string `json:"taskName"`
-		SessionID string `json:"sessionId,omitempty"`
+		TaskID    string   `json:"taskId"`
+		ProjectID string   `json:"projectId"`
+		TaskName  string   `json:"taskName"`
+		View      TaskView `json:"view"`
 	}
 
 	var running []runningTask
 	for _, t := range tasks {
-		if t.LastStatus == "running" {
-			running = append(running, runningTask{
-				TaskID:    t.ID,
-				ProjectID: t.ProjectID,
-				TaskName:  t.Name,
-				SessionID: t.LastSessionID,
-			})
+		if t.LastStatus != "running" {
+			continue
 		}
+		runID := t.LastSessionID
+		if t.SessionType == SessionTypePTY {
+			runID = t.LastTerminalID
+		}
+		running = append(running, runningTask{
+			TaskID:    t.ID,
+			ProjectID: t.ProjectID,
+			TaskName:  t.Name,
+			View:      taskView(t, runID),
+		})
 	}
 
 	msg := map[string]interface{}{
