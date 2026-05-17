@@ -217,9 +217,9 @@ func (s *Scheduler) executeTask(task Task) {
 
 	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID, "sessionType", task.SessionType)
 
-	// End previous session if one exists (one live session per task max).
+	// Delete previous session if one exists (one live session per task max).
 	// Dispatches by SessionType so a PTY task closes its previous terminal
-	// rather than trying to /stop a non-existent chat session.
+	// rather than trying to delete a non-existent chat session.
 	if current, err := s.store.Get(task.ID); err == nil && current != nil {
 		switch current.SessionType {
 		case SessionTypePTY:
@@ -228,7 +228,7 @@ func (s *Scheduler) executeTask(task Task) {
 			}
 		default:
 			if current.LastSessionID != "" {
-				s.client.EndSession(current.LastSessionID)
+				s.client.DeleteSession(current.LastSessionID)
 			}
 		}
 	}

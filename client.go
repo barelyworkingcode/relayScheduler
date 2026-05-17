@@ -182,8 +182,11 @@ func (c *LLMClient) SendMessage(sessionID, text string) (*MessageResponse, error
 	return &result, nil
 }
 
-func (c *LLMClient) EndSession(sessionID string) {
-	req, err := c.newRequest(http.MethodPost, fmt.Sprintf("/api/sessions/%s/stop", sessionID), nil)
+// fireAndForget issues a bodiless request and discards the response.
+// Best-effort: any error is swallowed because these endpoints are cleanup
+// operations on relayLLM where failure isn't actionable from here.
+func (c *LLMClient) fireAndForget(method, path string) {
+	req, err := c.newRequest(method, path, nil)
 	if err != nil {
 		return
 	}
@@ -192,6 +195,18 @@ func (c *LLMClient) EndSession(sessionID string) {
 		return
 	}
 	resp.Body.Close()
+}
+
+// StopGeneration aborts an in-flight LLM response without ending the session.
+func (c *LLMClient) StopGeneration(sessionID string) {
+	c.fireAndForget(http.MethodPost, fmt.Sprintf("/api/sessions/%s/stop", sessionID))
+}
+
+// DeleteSession removes the session from memory and disk on relayLLM.
+// Uses POST /api/sessions/{id}/delete rather than the DELETE verb — the
+// DELETE handler only ends the session and keeps the file on disk.
+func (c *LLMClient) DeleteSession(sessionID string) {
+	c.fireAndForget(http.MethodPost, fmt.Sprintf("/api/sessions/%s/delete", sessionID))
 }
 
 // --- Terminal/PTY methods ---
@@ -262,18 +277,10 @@ func (c *LLMClient) GetTerminalLog(terminalID string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// CloseTerminal kills a PTY session. Best-effort: errors are swallowed
-// because cleanup is non-critical (idle timeout would eventually GC it).
+// CloseTerminal kills a PTY session. Best-effort: cleanup is non-critical
+// because the relayLLM idle timeout would eventually GC it.
 func (c *LLMClient) CloseTerminal(terminalID string) {
-	req, err := c.newRequest(http.MethodDelete, "/api/terminals/"+terminalID, nil)
-	if err != nil {
-		return
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return
-	}
-	resp.Body.Close()
+	c.fireAndForget(http.MethodDelete, "/api/terminals/"+terminalID)
 }
 
 // AttachTerminalAndWait opens a WebSocket to relay's /ws endpoint, joins the
