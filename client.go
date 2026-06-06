@@ -36,10 +36,12 @@ type LLMClient struct {
 // Project mirrors the snake_case shape relay returns from /api/projects/{id}.
 // Only the fields the scheduler needs are decoded.
 type Project struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Path  string `json:"path"`
-	Token string `json:"token"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Path string `json:"path"`
+	// No Token: relay brokers project tokens now (it strips the token from
+	// /api/projects responses). The scheduler references projects by id and
+	// relayLLM resolves the scoped token from relay's bridge by projectId.
 }
 
 type SessionResponse struct {
@@ -95,10 +97,10 @@ func (c *LLMClient) newRequest(method, path string, body io.Reader) (*http.Reque
 	return req, nil
 }
 
-// GetProject fetches a project from relay's HTTP API. The scheduler needs
-// this because relayLLM is a pure execution engine: it expects callers to
-// pass `directory` and `mcpToken` explicitly, so the scheduler must resolve
-// them from relay first (the same shape Eve uses).
+// GetProject fetches a project from relay's HTTP API. The scheduler needs the
+// project's id and path to tell relayLLM which project to run under (by id) and
+// where (directory). The token is brokered by relay — relayLLM resolves the
+// scoped token from relay's bridge by projectId — so the scheduler never sees it.
 func (c *LLMClient) GetProject(projectID string) (*Project, error) {
 	req, err := c.newRequest(http.MethodGet, "/api/projects/"+projectID, nil)
 	if err != nil {
@@ -126,7 +128,6 @@ func (c *LLMClient) CreateSession(project *Project, model, name string) (*Sessio
 	payload, _ := json.Marshal(map[string]interface{}{
 		"projectId": project.ID,
 		"directory": project.Path,
-		"mcpToken":  project.Token,
 		"model":     model,
 		"name":      name,
 		"settings":  map[string]bool{"headless": true},
@@ -229,6 +230,7 @@ func (c *LLMClient) CreateTerminal(project *Project, templateID, name string, ex
 		"templateId": templateID,
 		"name":       name,
 		"directory":  project.Path,
+		"projectId":  project.ID, // lets relay issue a project-scoped token for the PTY
 		"cols":       120,
 		"rows":       30,
 		"extraArgs":  extraArgs,

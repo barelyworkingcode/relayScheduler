@@ -246,8 +246,9 @@ func (s *Scheduler) executeTask(task Task) {
 
 	model := task.Model
 
-	// Resolve the project so we can pass `directory` and `mcpToken` to relayLLM
-	// — relayLLM is a pure execution engine and has no project awareness.
+	// Resolve the project so we can pass `directory` + `projectId` to relayLLM
+	// — relayLLM is a pure execution engine and has no project awareness; relay
+	// brokers the scoped token from the projectId.
 	project, err := s.client.GetProject(task.ProjectID)
 	if err != nil {
 		exec.Status = "error"
