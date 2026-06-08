@@ -48,7 +48,11 @@ relayScheduler is a relay-enhanced service (see `../relay/plans/service-manifest
 
 1. Load tasks from `tasks.json` via the `TaskStore`; schedule the enabled ones.
 2. On trigger, resolve the project from relay (`GetProject` by id), then:
-   - **chat** tasks → create a headless session, send the prompt, capture the response.
+   - **chat** tasks → create a headless session, then drive the turn over the WS
+     event stream (`RunChatAndWait`), accumulating the reply until completion,
+     capped by `MaxDurationSeconds` (default 30m). Uses WS rather than the
+     blocking POST /message so slow local-model runs aren't falsely failed by
+     relayLLM's 5-minute synchronous response cap.
    - **PTY** tasks → create a terminal from a template, attach via WS, wait for exit.
 3. Log execution to `task-logs/`, broadcast `task_started` / `task_completed` /
    `task_error` on the hub (delivered to eve via `/ws/tasks`).

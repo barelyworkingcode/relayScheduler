@@ -289,14 +289,30 @@ func (s *Scheduler) executeTask(task Task) {
 
 	s.broadcastTaskEvent("task_started", task, session.SessionID, nil)
 
-	// Send the prompt and wait for the response.
-	result, err := s.client.SendMessage(session.SessionID, task.Prompt)
-	if err != nil {
+	// Drive the turn over the WebSocket and wait for completion, capped by the
+	// task's max duration. This replaces the blocking POST /message, whose
+	// 5-minute relayLLM-side cap recorded slow-but-progressing local-model runs
+	// as spurious errors (see RunChatAndWait).
+	timeout := time.Duration(task.MaxDurationSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = defaultChatTimeout
+	}
+	result, err := s.client.RunChatAndWait(session.SessionID, task.Prompt, timeout)
+	switch {
+	case errors.Is(err, ErrChatTimeout):
+		exec.Status = "timeout"
+		exec.Error = "task exceeded maxDurationSeconds"
+		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+		// Stop the still-running generation so it doesn't linger until the
+		// provider's own idle timeout.
+		s.client.StopGeneration(session.SessionID)
+		slog.Warn("task timed out", "task", task.Name, "timeout", timeout)
+	case err != nil:
 		exec.Status = "error"
 		exec.Error = err.Error()
 		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		slog.Error("task execution failed", "task", task.Name, "error", err)
-	} else {
+	default:
 		exec.Status = "success"
 		exec.Response = result.Response
 		exec.Stats = &result.Stats
@@ -313,10 +329,10 @@ func (s *Scheduler) executeTask(task Task) {
 	// Update last run status in store.
 	s.store.SetLastRun(task.ID, exec.Status)
 
-	if exec.Status == "error" {
-		s.broadcastTaskEvent("task_error", task, session.SessionID, map[string]interface{}{"error": exec.Error})
-	} else {
+	if exec.Status == "success" {
 		s.broadcastTaskEvent("task_completed", task, session.SessionID, map[string]interface{}{"status": exec.Status})
+	} else {
+		s.broadcastTaskEvent("task_error", task, session.SessionID, map[string]interface{}{"error": exec.Error, "status": exec.Status})
 	}
 
 	// Reschedule or disable.
@@ -367,6 +383,11 @@ func (s *Scheduler) Stop() {
 // defaultPtyTimeout is the wall-clock cap applied when a PTY task does not
 // set MaxDurationSeconds. Long-running daemons must opt in via that field.
 const defaultPtyTimeout = 30 * time.Minute
+
+// defaultChatTimeout caps a chat task's run when MaxDurationSeconds is unset.
+// Generous because local models can be slow over many tool calls; the WS stream
+// has no relayLLM-side cap, so this is the only bound.
+const defaultChatTimeout = 30 * time.Minute
 
 // broadcastTaskEvent sends a task lifecycle WS event with the standard
 // envelope (type, taskId, projectId, taskName, view). Extras are merged in

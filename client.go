@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// ErrChatTimeout is returned by RunChatAndWait when a chat turn does not
+// complete within the caller's wall-clock cap. Distinct so the scheduler can
+// record a "timeout" status (mirroring the PTY path) rather than a hard error.
+var ErrChatTimeout = errors.New("chat response timeout")
 
 // Synthetic exit codes the scheduler emits when the PTY didn't actually
 // produce one. Real process exits use 0..255; negative values are reserved
@@ -155,32 +161,98 @@ func (c *LLMClient) CreateSession(project *Project, model, name string) (*Sessio
 	return &session, nil
 }
 
-func (c *LLMClient) SendMessage(sessionID, text string) (*MessageResponse, error) {
-	payload, _ := json.Marshal(map[string]string{"text": text})
-
-	req, err := c.newRequest(http.MethodPost,
-		fmt.Sprintf("/api/sessions/%s/message", sessionID),
-		bytes.NewReader(payload),
-	)
+// RunChatAndWait drives one chat turn over the WebSocket and blocks until the
+// turn completes, errors, the provider dies, or the timeout elapses. It joins
+// the session, sends the prompt, and accumulates the streamed reply text + stats
+// from the broadcast event frames (the same frames relayLLM sends every viewer).
+//
+// Why WS instead of POST /api/sessions/{id}/message: that synchronous endpoint
+// caps a response at relayLLM's 5-minute collector.Wait and returns 504 past
+// it, which the scheduler recorded as a spurious "error" even though slow
+// local-model runs were still progressing and finished fine server-side. The WS
+// event stream has no such cap, so the only bound is this caller's timeout and a
+// long run reports its real outcome. Mirrors AttachTerminalAndWait for chat.
+func (c *LLMClient) RunChatAndWait(sessionID, prompt string, timeout time.Duration) (*MessageResponse, error) {
+	conn, err := c.dialWS("/ws")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial ws: %w", err)
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("send message: %w", err)
-	}
-	defer resp.Body.Close()
+	defer conn.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("send message failed (%d): %s", resp.StatusCode, body)
+	// Join first so we are a registered viewer before generation starts.
+	// relayLLM reads a connection's frames sequentially on one goroutine, so the
+	// join is processed (viewer added) before send_message kicks off the turn.
+	join, _ := json.Marshal(map[string]string{"type": "join_session", "sessionId": sessionID})
+	if err := conn.WriteMessage(websocket.TextMessage, join); err != nil {
+		return nil, fmt.Errorf("send join_session: %w", err)
+	}
+	send, _ := json.Marshal(map[string]string{"type": "send_message", "sessionId": sessionID, "text": prompt})
+	if err := conn.WriteMessage(websocket.TextMessage, send); err != nil {
+		return nil, fmt.Errorf("send_message: %w", err)
 	}
 
-	var result MessageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	var text strings.Builder
+	var stats SessionStats
+	deadline := time.Now().Add(timeout)
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ErrChatTimeout
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(remaining)); err != nil {
+			return nil, fmt.Errorf("set read deadline: %w", err)
+		}
+
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return nil, ErrChatTimeout
+			}
+			return nil, fmt.Errorf("ws read: %w", err)
+		}
+
+		var frame struct {
+			Type      string          `json:"type"`
+			SessionID string          `json:"sessionId"`
+			Event     json.RawMessage `json:"event"`
+			Stats     *SessionStats   `json:"stats"`
+			Message   string          `json:"message"`
+		}
+		if err := json.Unmarshal(raw, &frame); err != nil {
+			continue // unparseable frame — ignore and keep reading.
+		}
+		// The /ws stream is shared across sessions; ignore other sessions'
+		// frames (session-less frames like terminal events have no sessionId).
+		if frame.SessionID != "" && frame.SessionID != sessionID {
+			continue
+		}
+
+		switch frame.Type {
+		case "llm_event":
+			// Accumulate user-visible text only (text_delta), matching the
+			// synchronous ResponseCollector — thinking/tool blocks are excluded.
+			var ev struct {
+				Delta *struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"delta"`
+			}
+			if json.Unmarshal(frame.Event, &ev) == nil && ev.Delta != nil && ev.Delta.Type == "text_delta" {
+				text.WriteString(ev.Delta.Text)
+			}
+		case "stats_update":
+			if frame.Stats != nil {
+				stats = *frame.Stats
+			}
+		case "message_complete":
+			return &MessageResponse{Response: text.String(), Stats: stats}, nil
+		case "process_exited":
+			return nil, fmt.Errorf("provider process exited unexpectedly")
+		case "error":
+			return nil, fmt.Errorf("%s", frame.Message)
+		}
 	}
-	return &result, nil
 }
 
 // fireAndForget issues a bodiless request and discards the response.
