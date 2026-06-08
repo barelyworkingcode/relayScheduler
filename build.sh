@@ -19,10 +19,12 @@ fi
 codesign "${SIGN_ARGS[@]}" relayscheduler
 codesign --verify --strict --verbose=2 relayscheduler
 
+# No --url: relayScheduler no longer serves a TCP port. It registers a service
+# manifest with relay and is reached through relay's front door (Unix socket), so
+# there is no external HTTP URL for the Service Inspector to link to.
 /Applications/Relay.app/Contents/MacOS/relay service register \
   --name "Relay Scheduler" \
   --command "$(pwd)/relayscheduler" \
-  --url http://localhost:3002 \
   --autostart
 echo ""
 echo "Registered with Relay."
