@@ -20,44 +20,39 @@ import (
 // record a "timeout" status (mirroring the PTY path) rather than a hard error.
 var ErrChatTimeout = errors.New("chat response timeout")
 
-// Synthetic exit codes the scheduler emits when the PTY didn't actually
-// produce one. Real process exits use 0..255; negative values are reserved
-// for scheduler-side conditions. Documented in plans/well-lets-think-more-rippling-dongarra.md.
+// Synthetic exit codes for PTY runs that didn't produce a real one. Real
+// process exits use 0..255; negative values are scheduler-side conditions.
 const (
 	ExitCodeSessionLost  = -1 // WS dropped, relayLLM restart, or "terminal not found"
 	ExitCodeTimeout      = -2 // MaxDurationSeconds elapsed
-	ExitCodeCreateFailed = -3 // POST /api/terminals failed
+	ExitCodeCreateFailed = -3 // missing templateId, or POST /api/terminals failed
 )
 
-// LLMClient communicates with relay's HTTP API. After the front-door
-// migration, the scheduler talks only to relay (over a Unix socket); relay
-// reverse-proxies session traffic to relayLLM internally.
-type LLMClient struct {
+// RelayClient calls relay's front door, which routes session and terminal
+// traffic to relayLLM.
+type RelayClient struct {
 	baseURL    string
 	token      string
 	http       *http.Client
-	socketPath string // empty when using TCP; non-empty when dialing a Unix socket
+	socketPath string // empty when dialing baseURL over TCP
 }
 
-// Project mirrors the snake_case shape relay returns from /api/projects/{id}.
-// Only the fields the scheduler needs are decoded.
+// Project is the part of relay's /api/projects/{id} response the scheduler
+// uses. It has no token: relay brokers project-scoped tokens by projectId, so
+// the scheduler never sees one.
 type Project struct {
 	ID   string `json:"id"`
-	Name string `json:"name"`
 	Path string `json:"path"`
-	// No Token: relay brokers project tokens now (it strips the token from
-	// /api/projects responses). The scheduler references projects by id and
-	// relayLLM resolves the scoped token from relay's bridge by projectId.
 }
 
 type SessionResponse struct {
 	SessionID string `json:"sessionId"`
-	Model     string `json:"model"`
 }
 
-type MessageResponse struct {
-	Response string       `json:"response"`
-	Stats    SessionStats `json:"stats"`
+// ChatResult is one completed chat turn, assembled from the WS event stream.
+type ChatResult struct {
+	Response string
+	Stats    SessionStats
 }
 
 type SessionStats struct {
@@ -68,30 +63,26 @@ type SessionStats struct {
 	CostUsd             float64 `json:"costUsd"`
 }
 
-// NewLLMClient builds a client for relay's HTTP API.
-//
-// When socketPath is non-empty, the transport dials that Unix socket and the
-// baseURL host is purely cosmetic — required by the URL parser but ignored by
-// the dialer. Token is sent as a bearer header on every request.
-func NewLLMClient(baseURL, socketPath, token string) *LLMClient {
+// NewRelayClient builds a client for relay's front door. A non-empty socketPath
+// dials that Unix socket, and baseURL is replaced by a synthetic host the URL
+// parser accepts and the dialer ignores.
+func NewRelayClient(baseURL, socketPath, token string) *RelayClient {
 	transport := &http.Transport{}
 	if socketPath != "" {
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		}
-		// The host portion of the URL is irrelevant for Unix-socket transport
-		// but must parse cleanly; pin it to a synthetic value.
 		baseURL = "http://relay-frontend.localsocket"
 	}
-	return &LLMClient{
+	return &RelayClient{
 		baseURL:    baseURL,
 		token:      token,
-		http:       &http.Client{Timeout: 10 * time.Minute, Transport: transport},
+		http:       &http.Client{Timeout: 2 * time.Minute, Transport: transport},
 		socketPath: socketPath,
 	}
 }
 
-func (c *LLMClient) newRequest(method, path string, body io.Reader) (*http.Request, error) {
+func (c *RelayClient) newRequest(method, path string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequest(method, c.baseURL+path, body)
 	if err != nil {
 		return nil, err
@@ -103,11 +94,7 @@ func (c *LLMClient) newRequest(method, path string, body io.Reader) (*http.Reque
 	return req, nil
 }
 
-// GetProject fetches a project from relay's HTTP API. The scheduler needs the
-// project's id and path to tell relayLLM which project to run under (by id) and
-// where (directory). The token is brokered by relay — relayLLM resolves the
-// scoped token from relay's bridge by projectId — so the scheduler never sees it.
-func (c *LLMClient) GetProject(projectID string) (*Project, error) {
+func (c *RelayClient) GetProject(projectID string) (*Project, error) {
 	req, err := c.newRequest(http.MethodGet, "/api/projects/"+projectID, nil)
 	if err != nil {
 		return nil, err
@@ -130,7 +117,7 @@ func (c *LLMClient) GetProject(projectID string) (*Project, error) {
 	return &p, nil
 }
 
-func (c *LLMClient) CreateSession(project *Project, model, name string) (*SessionResponse, error) {
+func (c *RelayClient) CreateSession(project *Project, model, name string) (*SessionResponse, error) {
 	payload, _ := json.Marshal(map[string]interface{}{
 		"projectId": project.ID,
 		"directory": project.Path,
@@ -172,8 +159,8 @@ func (c *LLMClient) CreateSession(project *Project, model, name string) (*Sessio
 // local-model runs were still progressing and finished fine server-side. The WS
 // event stream has no such cap, so the only bound is this caller's timeout and a
 // long run reports its real outcome. Mirrors AttachTerminalAndWait for chat.
-func (c *LLMClient) RunChatAndWait(sessionID, prompt string, timeout time.Duration) (*MessageResponse, error) {
-	conn, err := c.dialWS("/ws")
+func (c *RelayClient) RunChatAndWait(sessionID, prompt string, timeout time.Duration) (*ChatResult, error) {
+	conn, err := c.dialWS()
 	if err != nil {
 		return nil, fmt.Errorf("dial ws: %w", err)
 	}
@@ -220,7 +207,7 @@ func (c *LLMClient) RunChatAndWait(sessionID, prompt string, timeout time.Durati
 			Message   string          `json:"message"`
 		}
 		if err := json.Unmarshal(raw, &frame); err != nil {
-			continue // unparseable frame — ignore and keep reading.
+			continue
 		}
 		// The /ws stream is shared across sessions; ignore other sessions'
 		// frames (session-less frames like terminal events have no sessionId).
@@ -230,8 +217,8 @@ func (c *LLMClient) RunChatAndWait(sessionID, prompt string, timeout time.Durati
 
 		switch frame.Type {
 		case "llm_event":
-			// Accumulate user-visible text only (text_delta), matching the
-			// synchronous ResponseCollector — thinking/tool blocks are excluded.
+			// Accumulate user-visible text only (text_delta), matching relayLLM's
+			// ResponseCollector — thinking/tool blocks are excluded.
 			var ev struct {
 				Delta *struct {
 					Type string `json:"type"`
@@ -246,7 +233,7 @@ func (c *LLMClient) RunChatAndWait(sessionID, prompt string, timeout time.Durati
 				stats = *frame.Stats
 			}
 		case "message_complete":
-			return &MessageResponse{Response: text.String(), Stats: stats}, nil
+			return &ChatResult{Response: text.String(), Stats: stats}, nil
 		case "process_exited":
 			return nil, fmt.Errorf("provider process exited unexpectedly")
 		case "error":
@@ -258,7 +245,7 @@ func (c *LLMClient) RunChatAndWait(sessionID, prompt string, timeout time.Durati
 // fireAndForget issues a bodiless request and discards the response.
 // Best-effort: any error is swallowed because these endpoints are cleanup
 // operations on relayLLM where failure isn't actionable from here.
-func (c *LLMClient) fireAndForget(method, path string) {
+func (c *RelayClient) fireAndForget(method, path string) {
 	req, err := c.newRequest(method, path, nil)
 	if err != nil {
 		return
@@ -271,33 +258,24 @@ func (c *LLMClient) fireAndForget(method, path string) {
 }
 
 // StopGeneration aborts an in-flight LLM response without ending the session.
-func (c *LLMClient) StopGeneration(sessionID string) {
+func (c *RelayClient) StopGeneration(sessionID string) {
 	c.fireAndForget(http.MethodPost, fmt.Sprintf("/api/sessions/%s/stop", sessionID))
 }
 
 // DeleteSession removes the session from memory and disk on relayLLM.
 // Uses POST /api/sessions/{id}/delete rather than the DELETE verb — the
 // DELETE handler only ends the session and keeps the file on disk.
-func (c *LLMClient) DeleteSession(sessionID string) {
+func (c *RelayClient) DeleteSession(sessionID string) {
 	c.fireAndForget(http.MethodPost, fmt.Sprintf("/api/sessions/%s/delete", sessionID))
 }
 
 // --- Terminal/PTY methods ---
 
-// TerminalResponse mirrors the response from POST /api/terminals.
 type TerminalResponse struct {
-	ID         string `json:"id"`
-	TemplateID string `json:"templateId"`
-	Name       string `json:"name"`
-	Directory  string `json:"directory"`
-	State      string `json:"state"`
+	ID string `json:"id"`
 }
 
-// CreateTerminal launches a PTY session on relayLLM with the given template
-// and per-task extra args. The terminal's directory defaults to project.Path.
-// On success, the returned ID is what callers persist on the Task and use
-// for AttachTerminalAndWait / GetTerminalLog / CloseTerminal.
-func (c *LLMClient) CreateTerminal(project *Project, templateID, name string, extraArgs []string) (*TerminalResponse, error) {
+func (c *RelayClient) CreateTerminal(project *Project, templateID, name string, extraArgs []string) (*TerminalResponse, error) {
 	payload, _ := json.Marshal(map[string]interface{}{
 		"templateId": templateID,
 		"name":       name,
@@ -333,7 +311,7 @@ func (c *LLMClient) CreateTerminal(project *Project, templateID, name string, ex
 // GetTerminalLog returns the stitched head+tail bytes of the PTY's output.
 // Works even after the in-memory session has been evicted, as long as the
 // log files have not been swept.
-func (c *LLMClient) GetTerminalLog(terminalID string) ([]byte, error) {
+func (c *RelayClient) GetTerminalLog(terminalID string) ([]byte, error) {
 	req, err := c.newRequest(http.MethodGet, fmt.Sprintf("/api/terminals/%s/log", terminalID), nil)
 	if err != nil {
 		return nil, err
@@ -353,7 +331,7 @@ func (c *LLMClient) GetTerminalLog(terminalID string) ([]byte, error) {
 
 // CloseTerminal kills a PTY session. Best-effort: cleanup is non-critical
 // because the relayLLM idle timeout would eventually GC it.
-func (c *LLMClient) CloseTerminal(terminalID string) {
+func (c *RelayClient) CloseTerminal(terminalID string) {
 	c.fireAndForget(http.MethodDelete, "/api/terminals/"+terminalID)
 }
 
@@ -364,11 +342,10 @@ func (c *LLMClient) CloseTerminal(terminalID string) {
 //   - timeout elapses → returns ExitCodeTimeout (-2).
 //   - WS error / close / "terminal not found" → returns ExitCodeSessionLost (-1).
 //
-// The scheduler does not buffer terminal_output frames — they are persisted
-// on the relayLLM side by terminalLogger. This WS attach exists purely to
-// learn the exit code reliably.
-func (c *LLMClient) AttachTerminalAndWait(terminalID string, timeout time.Duration) (int, error) {
-	conn, err := c.dialWS("/ws")
+// The scheduler does not buffer terminal_output frames — relayLLM persists them
+// to the terminal log. This WS attach exists purely to learn the exit code.
+func (c *RelayClient) AttachTerminalAndWait(terminalID string, timeout time.Duration) (int, error) {
+	conn, err := c.dialWS()
 	if err != nil {
 		return ExitCodeSessionLost, fmt.Errorf("dial ws: %w", err)
 	}
@@ -408,7 +385,7 @@ func (c *LLMClient) AttachTerminalAndWait(terminalID string, timeout time.Durati
 			Message  string `json:"message"`
 		}
 		if err := json.Unmarshal(msg, &frame); err != nil {
-			continue // unparseable frame — ignore and keep reading.
+			continue
 		}
 
 		switch frame.Type {
@@ -422,13 +399,11 @@ func (c *LLMClient) AttachTerminalAndWait(terminalID string, timeout time.Durati
 			}
 			return ExitCodeSessionLost, fmt.Errorf("ws error: %s", frame.Message)
 		}
-		// terminal_joined, terminal_output, etc. — keep reading.
 	}
 }
 
-// dialWS opens a WebSocket to relay's /ws endpoint, using the same Unix
-// socket the HTTP client uses when configured, and sending the bearer token.
-func (c *LLMClient) dialWS(path string) (*websocket.Conn, error) {
+// dialWS opens a WebSocket to relay's /ws, over the Unix socket when configured.
+func (c *RelayClient) dialWS() (*websocket.Conn, error) {
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
@@ -437,8 +412,7 @@ func (c *LLMClient) dialWS(path string) (*websocket.Conn, error) {
 			return (&net.Dialer{}).Dial("unix", c.socketPath)
 		}
 	}
-	// http://… → ws://… and https://… → wss://…
-	wsURL := strings.Replace(c.baseURL, "http", "ws", 1) + path
+	wsURL := strings.Replace(c.baseURL, "http", "ws", 1) + "/ws"
 	headers := http.Header{}
 	if c.token != "" {
 		headers.Set("Authorization", "Bearer "+c.token)

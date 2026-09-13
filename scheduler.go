@@ -18,13 +18,12 @@ type scheduledTask struct {
 	nextRun time.Time
 }
 
-// Scheduler manages task scheduling via a wall-clock ticker and executes
-// tasks via the LLM client. The ticker approach is resilient to macOS sleep
-// because each tick checks the real wall clock rather than relying on
-// monotonic-clock timers.
+// Scheduler fires tasks from a wall-clock ticker and runs them through relay.
+// The ticker is resilient to macOS sleep because each tick checks the real
+// wall clock rather than relying on monotonic-clock timers.
 type Scheduler struct {
 	mu       sync.Mutex
-	client   *LLMClient
+	client   *RelayClient
 	store    *TaskStore
 	logStore *LogStore
 	hub      *Hub
@@ -33,7 +32,7 @@ type Scheduler struct {
 	done     chan struct{}
 }
 
-func NewScheduler(client *LLMClient, store *TaskStore, logStore *LogStore, hub *Hub) *Scheduler {
+func NewScheduler(client *RelayClient, store *TaskStore, logStore *LogStore, hub *Hub) *Scheduler {
 	return &Scheduler{
 		client:   client,
 		store:    store,
@@ -51,7 +50,7 @@ func (s *Scheduler) Start() {
 }
 
 func (s *Scheduler) tickLoop() {
-	// Check immediately on start for any already-due tasks.
+	// Check immediately so tasks already due at startup don't wait a tick.
 	s.checkAndFireTasks()
 
 	ticker := time.NewTicker(30 * time.Second)
@@ -67,6 +66,7 @@ func (s *Scheduler) tickLoop() {
 	}
 }
 
+// missedThreshold is how late a run may be and still fire when CatchUp is off.
 const missedThreshold = 10 * time.Minute
 
 func (s *Scheduler) checkAndFireTasks() {
@@ -74,7 +74,7 @@ func (s *Scheduler) checkAndFireTasks() {
 
 	s.mu.Lock()
 	var toFire []Task
-	var toReschedule []Task
+	var toSkip []Task
 
 	for _, st := range s.tasks {
 		if !now.Before(st.nextRun) { // nextRun <= now
@@ -83,26 +83,30 @@ func (s *Scheduler) checkAndFireTasks() {
 			}
 			overdue := now.Sub(st.nextRun)
 			if !st.task.CatchUp && overdue > missedThreshold {
-				// Missed and catch-up disabled: skip, reschedule for next occurrence.
-				toReschedule = append(toReschedule, st.task)
+				toSkip = append(toSkip, st.task)
 			} else {
 				toFire = append(toFire, st.task)
 			}
 		}
 	}
 
-	// Remove fired/rescheduled tasks from the map.
-	// rescheduleOrDisable (for fired) and scheduleTaskLocked (for skipped)
-	// will re-add them with the next nextRun.
+	// Drop due tasks from the map. rescheduleOrDisable (fired) and the loop
+	// below (skipped) re-add them with their next run.
 	for _, task := range toFire {
 		delete(s.tasks, task.ID)
 	}
-	for _, task := range toReschedule {
+	for _, task := range toSkip {
 		delete(s.tasks, task.ID)
 	}
 
-	// Reschedule skipped tasks while still under lock.
-	for _, task := range toReschedule {
+	for _, task := range toSkip {
+		// A skipped one-shot has no next occurrence. Disable it rather than
+		// leave it enabled but never scheduled.
+		if st, _ := ScheduleType(task.Schedule); st == "once" {
+			slog.Info("disabling missed one-shot task (catch-up disabled)", "task", task.Name)
+			s.store.SetEnabled(task.ID, false)
+			continue
+		}
 		slog.Info("skipping missed task (catch-up disabled)", "task", task.Name)
 		s.scheduleTaskLocked(task)
 	}
@@ -111,10 +115,8 @@ func (s *Scheduler) checkAndFireTasks() {
 	}
 	s.mu.Unlock()
 
-	// Execute each due task in its own goroutine.
 	for _, task := range toFire {
-		taskCopy := task
-		go s.executeTask(taskCopy)
+		go s.executeTask(task)
 	}
 }
 
@@ -127,7 +129,6 @@ func (s *Scheduler) isStopped() bool {
 	}
 }
 
-// LoadAllTasks reads all tasks from the store and schedules enabled ones.
 func (s *Scheduler) LoadAllTasks() error {
 	tasks, err := s.store.Load()
 	if err != nil {
@@ -140,7 +141,7 @@ func (s *Scheduler) LoadAllTasks() error {
 	s.tasks = make(map[string]*scheduledTask)
 
 	for _, task := range tasks {
-		// Reset stale "running" status from crash recovery.
+		// A "running" status at startup means the previous process died mid-run.
 		if task.LastStatus == "running" {
 			slog.Warn("resetting stale running task", "task", task.Name, "id", task.ID)
 			s.store.SetLastRun(task.ID, "error")
@@ -155,7 +156,6 @@ func (s *Scheduler) LoadAllTasks() error {
 	return nil
 }
 
-// ScheduleTask schedules (or reschedules) a single task.
 func (s *Scheduler) ScheduleTask(task Task) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -169,14 +169,12 @@ func (s *Scheduler) ScheduleTask(task Task) {
 	s.scheduleTaskLocked(task)
 }
 
-// UnscheduleTask removes a task from the schedule.
 func (s *Scheduler) UnscheduleTask(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.tasks, taskID)
 }
 
-// UnscheduleByProject removes all tasks for a project from the schedule.
 func (s *Scheduler) UnscheduleByProject(projectID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,9 +215,8 @@ func (s *Scheduler) executeTask(task Task) {
 
 	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID, "sessionType", task.SessionType)
 
-	// Delete previous session if one exists (one live session per task max).
-	// Dispatches by SessionType so a PTY task closes its previous terminal
-	// rather than trying to delete a non-existent chat session.
+	// One live run per task: remove the previous run's session or terminal
+	// before starting a new one.
 	if current, err := s.store.Get(task.ID); err == nil && current != nil {
 		switch current.SessionType {
 		case SessionTypePTY:
@@ -244,41 +241,23 @@ func (s *Scheduler) executeTask(task Task) {
 	// Mark task as running so clients can detect in-progress execution.
 	s.store.SetLastRun(task.ID, "running")
 
-	model := task.Model
-
 	// Resolve the project so we can pass `directory` + `projectId` to relayLLM
 	// — relayLLM is a pure execution engine and has no project awareness; relay
 	// brokers the scoped token from the projectId.
 	project, err := s.client.GetProject(task.ProjectID)
 	if err != nil {
-		exec.Status = "error"
-		exec.Error = err.Error()
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		slog.Error("task project lookup failed", "task", task.Name, "error", err)
-		s.logStore.Log(task.ProjectID, task.ID, exec)
-		s.store.SetLastRun(task.ID, "error")
-		s.broadcastTaskEvent("task_error", task, "", map[string]interface{}{"error": err.Error()})
-		s.rescheduleOrDisable(task)
+		s.failRun(task, exec, err)
 		return
 	}
 
-	// PTY tasks take a different path — no LLM session, just a terminal.
 	if task.SessionType == SessionTypePTY {
 		s.runPtyTask(task, project, exec)
 		return
 	}
 
-	// Create a headless session via relayLLM (proxied through relay).
-	session, err := s.client.CreateSession(project, model, task.Name)
+	session, err := s.client.CreateSession(project, task.Model, task.Name)
 	if err != nil {
-		exec.Status = "error"
-		exec.Error = err.Error()
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		slog.Error("task session creation failed", "task", task.Name, "error", err)
-		s.logStore.Log(task.ProjectID, task.ID, exec)
-		s.store.SetLastRun(task.ID, "error")
-		s.broadcastTaskEvent("task_error", task, "", map[string]interface{}{"error": err.Error()})
-		s.rescheduleOrDisable(task)
+		s.failRun(task, exec, err)
 		return
 	}
 
@@ -289,20 +268,16 @@ func (s *Scheduler) executeTask(task Task) {
 
 	s.broadcastTaskEvent("task_started", task, session.SessionID, nil)
 
-	// Drive the turn over the WebSocket and wait for completion, capped by the
-	// task's max duration. This replaces the blocking POST /message, whose
-	// 5-minute relayLLM-side cap recorded slow-but-progressing local-model runs
-	// as spurious errors (see RunChatAndWait).
 	timeout := time.Duration(task.MaxDurationSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = defaultChatTimeout
 	}
 	result, err := s.client.RunChatAndWait(session.SessionID, task.Prompt, timeout)
+	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 	switch {
 	case errors.Is(err, ErrChatTimeout):
 		exec.Status = "timeout"
 		exec.Error = "task exceeded maxDurationSeconds"
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		// Stop the still-running generation so it doesn't linger until the
 		// provider's own idle timeout.
 		s.client.StopGeneration(session.SessionID)
@@ -310,23 +285,18 @@ func (s *Scheduler) executeTask(task Task) {
 	case err != nil:
 		exec.Status = "error"
 		exec.Error = err.Error()
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		slog.Error("task execution failed", "task", task.Name, "error", err)
 	default:
 		exec.Status = "success"
 		exec.Response = result.Response
 		exec.Stats = &result.Stats
-		exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		slog.Info("task completed", "task", task.Name,
 			"tokens", result.Stats.InputTokens+result.Stats.OutputTokens)
 	}
 
-	// Keep session alive for click-to-join (no EndSession call).
+	// The session stays alive so eve can open this run; the next run deletes it.
 
-	// Log the execution.
 	s.logStore.Log(task.ProjectID, task.ID, exec)
-
-	// Update last run status in store.
 	s.store.SetLastRun(task.ID, exec.Status)
 
 	if exec.Status == "success" {
@@ -335,7 +305,25 @@ func (s *Scheduler) executeTask(task Task) {
 		s.broadcastTaskEvent("task_error", task, session.SessionID, map[string]interface{}{"error": exec.Error, "status": exec.Status})
 	}
 
-	// Reschedule or disable.
+	s.rescheduleOrDisable(task)
+}
+
+// failRun records a run that failed before its session or terminal existed.
+// PTY runs get ExitCodeCreateFailed so their history always carries an exit code.
+func (s *Scheduler) failRun(task Task, exec Execution, err error) {
+	exec.Status = "error"
+	exec.Error = err.Error()
+	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	extra := map[string]interface{}{"error": exec.Error}
+	if task.SessionType == SessionTypePTY {
+		exitCode := ExitCodeCreateFailed
+		exec.ExitCode = &exitCode
+		extra["exitCode"] = exitCode
+	}
+	slog.Error("task failed to start", "task", task.Name, "sessionType", task.SessionType, "error", err)
+	s.logStore.Log(task.ProjectID, task.ID, exec)
+	s.store.SetLastRun(task.ID, "error")
+	s.broadcastTaskEvent("task_error", task, "", extra)
 	s.rescheduleOrDisable(task)
 }
 
@@ -371,7 +359,8 @@ func (s *Scheduler) rescheduleOrDisable(task Task) {
 	}
 }
 
-// Stop cancels all scheduled tasks and stops the ticker.
+// Stop halts the ticker and clears the schedule. In-flight runs finish on
+// their own.
 func (s *Scheduler) Stop() {
 	close(s.done)
 	s.mu.Lock()
@@ -380,8 +369,8 @@ func (s *Scheduler) Stop() {
 	s.mu.Unlock()
 }
 
-// defaultPtyTimeout is the wall-clock cap applied when a PTY task does not
-// set MaxDurationSeconds. Long-running daemons must opt in via that field.
+// defaultPtyTimeout caps a PTY run when MaxDurationSeconds is unset.
+// Long-running daemons must opt in to a longer cap via that field.
 const defaultPtyTimeout = 30 * time.Minute
 
 // defaultChatTimeout caps a chat task's run when MaxDurationSeconds is unset.
@@ -389,11 +378,10 @@ const defaultPtyTimeout = 30 * time.Minute
 // has no relayLLM-side cap, so this is the only bound.
 const defaultChatTimeout = 30 * time.Minute
 
-// broadcastTaskEvent sends a task lifecycle WS event with the standard
-// envelope (type, taskId, projectId, taskName, view). Extras are merged in
-// for event-specific fields like `status`, `error`, `exitCode`. Use the
-// helper instead of hand-building the map so the view envelope stays
-// consistent across every broadcast site.
+// broadcastTaskEvent sends a lifecycle event with the standard envelope (type,
+// taskId, projectId, taskName, view) plus event-specific extras such as
+// status, error, and exitCode. Every broadcast goes through here so the view
+// envelope stays consistent.
 func (s *Scheduler) broadcastTaskEvent(eventType string, task Task, runID string, extra map[string]interface{}) {
 	msg := map[string]interface{}{
 		"type":      eventType,
@@ -416,7 +404,7 @@ func (s *Scheduler) broadcastTaskEvent(eventType string, task Task, runID string
 // and Status="running" from executeTask.
 func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 	if task.TemplateID == "" {
-		s.failPtyTask(task, exec, "PTY task missing templateId", ExitCodeCreateFailed)
+		s.failRun(task, exec, errors.New("PTY task missing templateId"))
 		return
 	}
 
@@ -431,7 +419,7 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 
 	term, err := s.client.CreateTerminal(&projectForTerminal, task.TemplateID, task.Name, task.ExtraArgs)
 	if err != nil {
-		s.failPtyTask(task, exec, err.Error(), ExitCodeCreateFailed)
+		s.failRun(task, exec, err)
 		return
 	}
 
@@ -497,21 +485,6 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 	s.rescheduleOrDisable(task)
 }
 
-// failPtyTask records a PTY-mode failure that occurred before the WS attach
-// (typically template missing or POST /api/terminals returned an error).
-func (s *Scheduler) failPtyTask(task Task, exec Execution, msg string, exitCode int) {
-	exec.Status = "error"
-	exec.Error = msg
-	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-	exec.ExitCode = &exitCode
-	slog.Error("pty task failed", "task", task.Name, "error", msg)
-	s.logStore.Log(task.ProjectID, task.ID, exec)
-	s.store.SetLastRun(task.ID, "error")
-	s.broadcastTaskEvent("task_error", task, "", map[string]interface{}{"error": msg, "exitCode": exitCode})
-	s.rescheduleOrDisable(task)
-}
-
-// RunTaskNow executes a task immediately, bypassing the schedule.
 func (s *Scheduler) RunTaskNow(taskID string) error {
 	task, err := s.store.Get(taskID)
 	if err != nil {
@@ -532,4 +505,3 @@ func (s *Scheduler) RunTaskNow(taskID string) error {
 	go s.executeTask(*task)
 	return nil
 }
-

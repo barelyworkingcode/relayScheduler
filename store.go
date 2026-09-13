@@ -24,11 +24,12 @@ func NewTaskStore(dataDir string) *TaskStore {
 
 func generateID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 
-// Load reads all tasks from disk.
 func (s *TaskStore) Load() ([]Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,7 +68,6 @@ func (s *TaskStore) writeLocked(tasks []Task) error {
 	return os.Rename(tmp, s.path)
 }
 
-// ListByProject returns tasks filtered by project ID.
 func (s *TaskStore) ListByProject(projectID string) ([]Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -85,7 +85,7 @@ func (s *TaskStore) ListByProject(projectID string) ([]Task, error) {
 	return result, nil
 }
 
-// Get returns a single task by ID.
+// Get returns nil, nil when the task doesn't exist.
 func (s *TaskStore) Get(id string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,7 +102,6 @@ func (s *TaskStore) Get(id string) (*Task, error) {
 	return nil, nil
 }
 
-// Create adds a new task with a generated ID and timestamps.
 func (s *TaskStore) Create(task Task) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -125,7 +124,9 @@ func (s *TaskStore) Create(task Task) (*Task, error) {
 	return &task, nil
 }
 
-// Update replaces a task by ID. Returns the updated task or nil if not found.
+// Update replaces a task's definition and returns nil, nil if it doesn't exist.
+// Run state (LastRun, LastStatus, LastSessionID, LastTerminalID) is kept when
+// the update leaves it empty, because clients send definitions, not run state.
 func (s *TaskStore) Update(id string, updated Task) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -163,7 +164,7 @@ func (s *TaskStore) Update(id string, updated Task) (*Task, error) {
 	return nil, nil
 }
 
-// Delete removes a task by ID. Returns true if found and deleted.
+// Delete reports whether the task existed.
 func (s *TaskStore) Delete(id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,7 +187,6 @@ func (s *TaskStore) Delete(id string) (bool, error) {
 	return false, nil
 }
 
-// DeleteByProject removes all tasks for a project. Returns count deleted.
 func (s *TaskStore) DeleteByProject(projectID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,7 +217,9 @@ func (s *TaskStore) DeleteByProject(projectID string) (int, error) {
 	return deleted, nil
 }
 
-// updateTask is a shared helper for lock/read/find/mutate/write operations.
+// updateTask applies fn to one task and persists it. Errors are logged rather
+// than returned: callers record run state mid-execution, where a failed write
+// must not abort the run.
 func (s *TaskStore) updateTask(id string, fn func(*Task)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -240,7 +242,6 @@ func (s *TaskStore) updateTask(id string, fn func(*Task)) {
 	}
 }
 
-// SetLastRun updates the LastRun and LastStatus for a task (called after execution).
 func (s *TaskStore) SetLastRun(id, status string) {
 	s.updateTask(id, func(t *Task) {
 		t.LastRun = time.Now().UTC().Format(time.RFC3339)
@@ -248,23 +249,20 @@ func (s *TaskStore) SetLastRun(id, status string) {
 	})
 }
 
-// SetLastSessionID updates the LastSessionID for a task.
 func (s *TaskStore) SetLastSessionID(id, sessionID string) {
 	s.updateTask(id, func(t *Task) {
 		t.LastSessionID = sessionID
 	})
 }
 
-// SetLastTerminalID updates the LastTerminalID for a PTY task. Eve uses
-// this to wire the "View Last Run" click on a terminal task to the read-only
-// PTY viewer.
+// SetLastTerminalID records a PTY task's latest terminal. Eve uses it to open
+// the task's last run in the read-only PTY viewer.
 func (s *TaskStore) SetLastTerminalID(id, terminalID string) {
 	s.updateTask(id, func(t *Task) {
 		t.LastTerminalID = terminalID
 	})
 }
 
-// SetEnabled updates the Enabled flag for a task.
 func (s *TaskStore) SetEnabled(id string, enabled bool) {
 	s.updateTask(id, func(t *Task) {
 		t.Enabled = enabled

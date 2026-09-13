@@ -10,7 +10,9 @@ import (
 
 const maxLogEntries = 100
 
-// LogStore persists task execution history to JSON files.
+// LogStore keeps each task's execution history in its own JSON file, newest
+// first, capped at maxLogEntries. It has no lock: the scheduler's running set
+// allows one execution per task, so only one writer touches a file at a time.
 type LogStore struct {
 	dir string
 }
@@ -23,19 +25,13 @@ func (s *LogStore) logPath(projectID, taskID string) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%s-%s.json", projectID, taskID))
 }
 
-// Log appends an execution record to the log file.
 func (s *LogStore) Log(projectID, taskID string, exec Execution) {
 	if err := os.MkdirAll(s.dir, 0700); err != nil {
 		slog.Error("failed to create log directory", "error", err)
 		return
 	}
 
-	history := s.Load(projectID, taskID)
-
-	// Prepend new entry (newest first).
-	history = append([]Execution{exec}, history...)
-
-	// Truncate to max entries.
+	history := append([]Execution{exec}, s.Load(projectID, taskID)...)
 	if len(history) > maxLogEntries {
 		history = history[:maxLogEntries]
 	}
@@ -57,7 +53,6 @@ func (s *LogStore) Log(projectID, taskID string, exec Execution) {
 	}
 }
 
-// Load reads the execution history for a task.
 func (s *LogStore) Load(projectID, taskID string) []Execution {
 	data, err := os.ReadFile(s.logPath(projectID, taskID))
 	if err != nil {

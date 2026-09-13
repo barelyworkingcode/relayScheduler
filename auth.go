@@ -9,9 +9,8 @@ import (
 	"strings"
 )
 
-// generateBearerToken returns a random 32-byte hex token. Used to auto-generate
-// the internal bearer when one isn't supplied via flag/env so the listener is
-// never unauthenticated. Mirrors ../relayLLM/auth.go.
+// generateBearerToken returns a random 32-byte hex token for the inbound
+// listener when none is supplied. Mirrors ../relayLLM/auth.go.
 func generateBearerToken() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -20,18 +19,14 @@ func generateBearerToken() string {
 	return hex.EncodeToString(b)
 }
 
-// bearerAuth wraps an http.Handler with bearer-token authentication.
-//
-// If token is empty the middleware is a pass-through (standalone/dev on
-// loopback). When set, every request — including the /ws/tasks WebSocket
-// upgrade — must carry `Authorization: Bearer <token>` or it is rejected with
-// 401 before any handler runs (so the WS upgrade never registers a hub client
-// for an unauthenticated caller). Under relay, relay strips the inbound frontend
-// bearer and injects this service-declared token when proxying. Comparison uses
-// crypto/subtle.ConstantTimeCompare. Mirrors ../relayLLM/auth.go.
+// bearerAuth rejects any request without `Authorization: Bearer <token>`
+// before a handler runs, so an unauthenticated /ws/tasks upgrade never
+// registers a hub client. Under relay, the front-door dispatcher replaces the
+// caller's bearer with this token when proxying. Mirrors ../relayLLM/auth.go.
 func bearerAuth(token string, next http.Handler) http.Handler {
+	// An empty token would match an empty bearer and leave the listener open.
 	if token == "" {
-		return next
+		panic("bearerAuth: empty token")
 	}
 	expected := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

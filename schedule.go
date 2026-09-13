@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// ScheduleType extracts the "type" field from a schedule JSON blob.
 func ScheduleType(raw json.RawMessage) (string, error) {
 	var base struct {
 		Type string `json:"type"`
@@ -22,8 +21,9 @@ func ScheduleType(raw json.RawMessage) (string, error) {
 	return base.Type, nil
 }
 
-// ValidateSchedule checks that a schedule JSON blob is well-formed and has
-// valid parameters. Returns nil if the schedule is valid.
+// ValidateSchedule rejects malformed schedules and one-shot times already in
+// the past. CalculateNextRun can't reject the latter: it must return past
+// "once" times so a run missed during downtime can still catch up.
 func ValidateSchedule(raw json.RawMessage) error {
 	st, err := ScheduleType(raw)
 	if err != nil {
@@ -32,11 +32,18 @@ func ValidateSchedule(raw json.RawMessage) error {
 	if st == "on_demand" {
 		return nil
 	}
-	_, err = CalculateNextRun(raw)
-	return err
+	next, err := CalculateNextRun(raw)
+	if err != nil {
+		return err
+	}
+	if st == "once" && !next.After(time.Now()) {
+		return fmt.Errorf("once schedule 'at' is in the past: %s", next.Format(time.RFC3339))
+	}
+	return nil
 }
 
-// CalculateNextRun computes the next execution time for a schedule.
+// CalculateNextRun computes a schedule's next execution time. For "once" the
+// result may be in the past; the tick loop decides whether to fire or skip it.
 func CalculateNextRun(scheduleRaw json.RawMessage) (time.Time, error) {
 	st, err := ScheduleType(scheduleRaw)
 	if err != nil {
@@ -95,9 +102,6 @@ func CalculateNextRun(scheduleRaw json.RawMessage) (time.Time, error) {
 		t, err := time.Parse(time.RFC3339, s.At)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("parse once schedule 'at': %w", err)
-		}
-		if !t.After(now) {
-			return time.Time{}, fmt.Errorf("once schedule 'at' is in the past: %s", s.At)
 		}
 		return t, nil
 
@@ -171,7 +175,6 @@ func nextWeekly(now time.Time, day, timeStr string) (time.Time, error) {
 		return time.Time{}, err
 	}
 
-	// Move to the target day of the week.
 	daysUntil := int(targetDay) - int(now.Weekday())
 	if daysUntil < 0 {
 		daysUntil += 7
@@ -184,6 +187,8 @@ func nextWeekly(now time.Time, day, timeStr string) (time.Time, error) {
 	return next, nil
 }
 
+// nextCron supports only "M H * * *" (daily) and "M * * * *" (hourly). Anything
+// richer is rejected rather than silently misread.
 func nextCron(now time.Time, expression string) (time.Time, error) {
 	parts := strings.Fields(expression)
 	if len(parts) != 5 {
@@ -192,14 +197,12 @@ func nextCron(now time.Time, expression string) (time.Time, error) {
 
 	minute, hour, dom, month, dow := parts[0], parts[1], parts[2], parts[3], parts[4]
 
-	// Reject syntax we can't correctly evaluate — step values, lists, ranges.
 	for _, field := range parts {
 		if strings.ContainsAny(field, "/,-") {
 			return time.Time{}, fmt.Errorf("step (/), range (-), and list (,) syntax not supported in cron expression: %q; use 'interval', 'weekly', or 'daily' schedule types instead", expression)
 		}
 	}
 
-	// Only wildcard is supported for day-of-month, month, and day-of-week.
 	if dom != "*" || month != "*" || dow != "*" {
 		return time.Time{}, fmt.Errorf("day-of-month, month, and day-of-week constraints not supported: %q; use 'weekly' or 'daily' schedule types instead", expression)
 	}
@@ -214,7 +217,6 @@ func nextCron(now time.Time, expression string) (time.Time, error) {
 	}
 
 	if hour == "*" {
-		// Specific minute, any hour: hourly.
 		return nextHourly(now, m), nil
 	}
 
@@ -223,7 +225,6 @@ func nextCron(now time.Time, expression string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("invalid hour %q in cron expression (must be 0-23)", hour)
 	}
 
-	// Specific minute and hour: daily.
 	next := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
 	if !next.After(now) {
 		next = time.Date(now.Year(), now.Month(), now.Day()+1, h, m, 0, 0, now.Location())
