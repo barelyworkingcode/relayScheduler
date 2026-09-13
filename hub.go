@@ -37,8 +37,7 @@ func (h *Hub) Unregister(conn *websocket.Conn) {
 	h.mu.Unlock()
 }
 
-// Broadcast sends a JSON message to all connected clients.
-// Unregisters clients that fail to receive.
+// Broadcast writes msg to every client, closing and dropping any that fail.
 func (h *Hub) Broadcast(msg interface{}) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -59,7 +58,6 @@ func (h *Hub) Broadcast(msg interface{}) {
 	}
 }
 
-// SendStatus sends a task_status snapshot of all currently running tasks to a single connection.
 func (h *Hub) SendStatus(conn *websocket.Conn) {
 	tasks, err := h.store.Load()
 	if err != nil {
@@ -79,15 +77,11 @@ func (h *Hub) SendStatus(conn *websocket.Conn) {
 		if t.LastStatus != "running" {
 			continue
 		}
-		runID := t.LastSessionID
-		if t.SessionType == SessionTypePTY {
-			runID = t.LastTerminalID
-		}
 		running = append(running, runningTask{
 			TaskID:    t.ID,
 			ProjectID: t.ProjectID,
 			TaskName:  t.Name,
-			View:      taskView(t, runID),
+			View:      taskView(t, ""),
 		})
 	}
 

@@ -73,19 +73,19 @@ func (t Task) MarshalJSON() ([]byte, error) {
 //	    ExtraArgs appended. Result is the process exit code and the raw
 //	    byte stream (head + tail log). Eve replays via LastTerminalID.
 type Task struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Prompt    string          `json:"prompt"`
-	Schedule  json.RawMessage `json:"schedule"`
-	Enabled   bool            `json:"enabled"`
-	Model     string          `json:"model,omitempty"`
-	ProjectID string          `json:"projectId"`
-	CreatedAt string          `json:"createdAt"`
-	UpdatedAt string          `json:"updatedAt,omitempty"`
-	LastRun   string          `json:"lastRun,omitempty"`
-	LastStatus    string `json:"lastStatus,omitempty"` // "success", "error", "timeout"
-	LastSessionID string `json:"lastSessionId,omitempty"`
-	CatchUp       bool   `json:"catchUp"` // Run missed executions after sleep/wake
+	ID            string          `json:"id"`
+	Name          string          `json:"name"`
+	Prompt        string          `json:"prompt"`
+	Schedule      json.RawMessage `json:"schedule"`
+	Enabled       bool            `json:"enabled"`
+	Model         string          `json:"model,omitempty"`
+	ProjectID     string          `json:"projectId"`
+	CreatedAt     string          `json:"createdAt"`
+	UpdatedAt     string          `json:"updatedAt,omitempty"`
+	LastRun       string          `json:"lastRun,omitempty"`
+	LastStatus    string          `json:"lastStatus,omitempty"` // "running", "success", "error", "timeout"
+	LastSessionID string          `json:"lastSessionId,omitempty"`
+	CatchUp       bool            `json:"catchUp"` // fire runs missed by more than missedThreshold instead of skipping them
 
 	// PTY-mode fields. Zero-valued for legacy headless tasks; no migration
 	// needed. SessionType is "headless" (or "") for chat, "pty" for terminal.
@@ -96,8 +96,6 @@ type Task struct {
 	MaxDurationSeconds int      `json:"maxDurationSeconds,omitempty"`
 	LastTerminalID     string   `json:"lastTerminalId,omitempty"`
 }
-
-// Schedule types parsed from the schedule JSON.
 
 type DailySchedule struct {
 	Type string `json:"type"`

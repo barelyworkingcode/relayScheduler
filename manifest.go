@@ -6,30 +6,16 @@ import (
 	"os"
 )
 
-// Manifest is the wire shape relayScheduler declares to relay. Must stay
-// field-compatible with relay/bridge/manifest.go (a separate Go module, so the
-// types are intentionally mirrored here). Same pattern as ../relayLLM/manifest.go.
+// Manifest is the wire shape relayScheduler declares to relay: the subset of
+// relay/internal/bridge/manifest.go this service uses (relay is a separate Go
+// module, so the type is mirrored). relay also accepts status and action
+// declarations; the scheduler declares neither.
 type Manifest struct {
-	Routes  []string     `json:"routes"`
-	Status  *StatusDecl  `json:"status,omitempty"`
-	Actions []ActionDecl `json:"actions,omitempty"`
+	Routes []string `json:"routes"`
 }
 
-type StatusDecl struct {
-	Path string `json:"path"`
-}
-
-type ActionDecl struct {
-	ID           string `json:"id"`
-	Label        string `json:"label"`
-	Method       string `json:"method"`
-	PathTemplate string `json:"pathTemplate"`
-	ForEach      string `json:"forEach,omitempty"`
-}
-
-// registerManifestRequest is the Arguments payload for the RegisterManifest
-// bridge call. Field names mirror relay/bridge/manifest.go's
-// RegisterManifestRequest.
+// registerManifestRequest mirrors RegisterManifestRequest in
+// relay/internal/bridge/manifest.go.
 type registerManifestRequest struct {
 	ServiceID      string   `json:"serviceId"`
 	Manifest       Manifest `json:"manifest"`
@@ -39,9 +25,9 @@ type registerManifestRequest struct {
 
 // buildManifest declares the routes relay's front-door dispatcher forwards to
 // this service. "/api/tasks" (exact) + "/api/tasks/" (prefix) cover the task
-// CRUD + run + history API; "/ws/tasks" carries the task-lifecycle event stream
-// eve subscribes to. A distinct "/ws/tasks" path (not "/ws") is required:
-// relayLLM already claims "/ws" and relay rejects duplicate routes.
+// API; "/ws/tasks" carries the lifecycle event stream eve subscribes to. It
+// can't be "/ws": relayLLM already claims that and relay rejects duplicate
+// routes.
 func buildManifest() Manifest {
 	return Manifest{
 		Routes: []string{
@@ -53,13 +39,13 @@ func buildManifest() Manifest {
 }
 
 // maybeRegisterManifest tells relay where to dispatch front-door traffic for
-// this service. Standalone runs (no RELAY_BRIDGE_SOCKET set) are a clean no-op —
-// direct clients still reach the listener.
+// this service. Standalone runs (no RELAY_BRIDGE_SOCKET) are a no-op.
 //
-// Failure is logged and swallowed: the listener is already up, so missing the
-// relay-dispatch path is a partial degradation, not a hard error.
+// Failure is logged and swallowed: the listener is already up, so losing
+// relay dispatch is a partial degradation, not a reason to exit.
 func maybeRegisterManifest(internalSocket, internalToken string) {
-	if os.Getenv(envBridgeSocket) == "" {
+	bridgeSocket := os.Getenv(envBridgeSocket)
+	if bridgeSocket == "" {
 		slog.Info("standalone mode — skipping manifest registration")
 		return
 	}
@@ -80,7 +66,7 @@ func maybeRegisterManifest(internalSocket, internalToken string) {
 		slog.Error("marshal manifest registration failed", "error", err)
 		return
 	}
-	if _, err := sendBridgeRequest(reqRegisterManifest, args); err != nil {
+	if err := sendBridgeRequest(bridgeSocket, reqRegisterManifest, args); err != nil {
 		slog.Error("manifest registration failed; running without relay dispatch", "error", err)
 		return
 	}

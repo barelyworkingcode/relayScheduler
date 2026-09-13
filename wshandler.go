@@ -23,7 +23,6 @@ func HandleWS(hub *Hub) http.HandlerFunc {
 		hub.Register(conn)
 		slog.Info("ws client connected", "remote", r.RemoteAddr)
 
-		// Send current running task snapshot.
 		hub.SendStatus(conn)
 
 		// Read pump: discard incoming messages, detect disconnect.
