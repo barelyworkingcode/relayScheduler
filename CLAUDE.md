@@ -12,7 +12,8 @@ run history record, API, and WS events.** Keep it in sync when behavior changes.
 Flat `package main`, one file per concern:
 
 ```
-main.go               Entry point, flags, Unix-socket listener, manifest registration
+main.go               Entry point: launch identity first, then flags, Unix-socket listener, manifest registration
+launch.go             Relay launch identity: read the fd-3 secret, scrub env, Hello over the bridge
 client.go             RelayClient: outbound calls to relay's front door (projects, sessions, terminals, /ws)
 task.go               Task + Execution types, TaskView envelope, schedule structs
 schedule.go           Schedule validation + next-run calculation
@@ -22,7 +23,7 @@ logstore.go           Per-task run history (newest first, capped at 100)
 hub.go / wshandler.go WebSocket hub + /ws/tasks upgrade handler
 api.go                Task API on Go 1.22 method/wildcard mux patterns
 manifest.go           Front-door manifest (routes) + RegisterManifest call
-bridge.go             Minimal relay bridge client (service-token auth) used for registration
+bridge.go             Minimal relay bridge client (tokenless; identity-authenticated) used for registration
 auth.go               Bearer-auth middleware + token generation for the inbound listener
 ```
 
@@ -43,21 +44,33 @@ relayScheduler is a relay-enhanced service (protocol: `../relay/docs/service-man
 - **Inbound.** Serves its HTTP + WS API on a Unix socket (`--socket`, default
   `{data-dir}/relayscheduler.sock`), bearer-authed (`auth.go`). It picks its own
   socket path and token and tells relay both via manifest registration.
-- **Registration.** When relay spawns it, relay injects `RELAY_BRIDGE_SOCKET`,
-  `RELAY_SERVICE_ID`, and `RELAY_SERVICE_TOKEN` (plus the legacy
-  `RELAY_MCP_TOKEN`). The scheduler sends `RegisterManifest` declaring
-  `/api/tasks`, `/api/tasks/`, `/ws/tasks`. relay's dispatcher reverse-proxies
-  those routes to the socket, replacing the caller's bearer with the scheduler's
-  internal token.
+- **Launch identity** (`../relay/docs/launch-identity.md`). relay puts no
+  credential in the environment. It sets `RELAY_LAUNCH_FD=3`,
+  `RELAY_BRIDGE_SOCKET`, `RELAY_SERVICE_ID`, `RELAY_FRONTEND_SOCKET`, and passes a
+  64-hex launch secret on fd 3. `bootstrapLaunchIdentity` is the first thing
+  `main` does: it unsets `RELAY_LAUNCH_FD` and the removed
+  `RELAY_SERVICE_TOKEN` / `RELAY_MCP_TOKEN` / `RELAY_FRONTEND_TOKEN`, drains and
+  closes fd 3, and sends `Hello`. Any failure while `RELAY_LAUNCH_FD` is set
+  exits non-zero; never degrade to standalone. relay then recognises this exact
+  process by its kernel audit token, so later bridge requests carry no `token`
+  key and frontend requests carry no `Authorization` header. The secret is held
+  only for the Hello round-trip and never logged. The scheduler spawns no child
+  processes; if that changes, strip `RELAY_LAUNCH_FD` from their environment.
+- **Registration.** After Hello, the scheduler sends `RegisterManifest` (no
+  token, `serviceId` = `RELAY_SERVICE_ID`) declaring `/api/tasks`,
+  `/api/tasks/`, `/ws/tasks`. relay's dispatcher reverse-proxies those routes to
+  the socket, replacing the caller's bearer with the scheduler's internal token.
+  Registered with `--capability frontend --capability manifest` (`build.sh`).
 - **`/ws/tasks`, not `/ws`.** relayLLM already claims `/ws` and relay rejects
   duplicate routes. eve's server opens a second upstream WS to `/ws/tasks` and
   forwards task frames to the browser (eve `relay-client.js`).
-- **Standalone** (no `RELAY_BRIDGE_SOCKET`): registration is a no-op; the
+- **Standalone** (no `RELAY_LAUNCH_FD`): no Hello, registration is a no-op; the
   listener still serves direct clients.
 - **Outbound.** To run a task, the scheduler dials relay's front door
-  (`RELAY_FRONTEND_SOCKET` / `RELAY_FRONTEND_TOKEN`), which routes sessions and
-  terminals to relayLLM. Projects are referenced by id only; relay brokers the
-  project-scoped token.
+  (`RELAY_FRONTEND_SOCKET`), which routes sessions and terminals to relayLLM.
+  Under relay it is authenticated by identity and `--relay-token` is ignored;
+  standalone it presents `--relay-token` / `RELAY_FRONTEND_TOKEN` as a bearer.
+  Projects are referenced by id only; relay brokers the project-scoped token.
 
 ## Execution flow
 
@@ -93,12 +106,13 @@ Invariants worth keeping:
 --token        Inbound bearer (auto-generated and never logged if empty, env RELAY_SCHEDULER_TOKEN)
 --data-dir     Data directory (default os.UserConfigDir()/relayScheduler, env RELAY_SCHEDULER_DATA)
 --relay-socket Outbound: relay frontend socket (env RELAY_FRONTEND_SOCKET)
---relay-token  Outbound: relay frontend bearer (env RELAY_FRONTEND_TOKEN)
+--relay-token  Outbound: relay frontend bearer, standalone only (env RELAY_FRONTEND_TOKEN)
 --relay-url    Outbound base URL when --relay-socket is empty (default http://localhost:3000, env RELAY_FRONTEND_URL)
 ```
 
-Under relay, only the outbound `RELAY_FRONTEND_*` values come from the
-environment; `--socket`, `--token`, and `--data-dir` use their defaults.
+Under relay, only `RELAY_FRONTEND_SOCKET` comes from the environment;
+`--relay-token` is ignored, and `--socket`, `--token`, and `--data-dir` use
+their defaults.
 
 ## Build and test
 

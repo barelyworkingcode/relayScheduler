@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"log/slog"
-	"os"
 )
 
 // Manifest is the wire shape relayScheduler declares to relay: the subset of
@@ -39,24 +38,21 @@ func buildManifest() Manifest {
 }
 
 // maybeRegisterManifest tells relay where to dispatch front-door traffic for
-// this service. Standalone runs (no RELAY_BRIDGE_SOCKET) are a no-op.
+// this service. Without a launch identity (standalone) it is a no-op: a
+// tokenless bridge request from an unbound process is not a service to relay.
 //
 // Failure is logged and swallowed: the listener is already up, so losing
 // relay dispatch is a partial degradation, not a reason to exit.
-func maybeRegisterManifest(internalSocket, internalToken string) {
-	bridgeSocket := os.Getenv(envBridgeSocket)
-	if bridgeSocket == "" {
+func maybeRegisterManifest(identity *launchIdentity, internalSocket, internalToken string) {
+	if identity == nil {
 		slog.Info("standalone mode — skipping manifest registration")
 		return
 	}
-	serviceID := os.Getenv(envServiceID)
-	if serviceID == "" {
-		slog.Warn("bridge socket set but service ID missing — skipping manifest registration", "env", envServiceID)
-		return
-	}
+	bridgeSocket, serviceID := identity.bridgeSocket, identity.serviceID
 
 	manifest := buildManifest()
 	args, err := json.Marshal(registerManifestRequest{
+		// relay accepts RegisterManifest only under the id bound at Hello.
 		ServiceID:      serviceID,
 		Manifest:       manifest,
 		InternalSocket: internalSocket,

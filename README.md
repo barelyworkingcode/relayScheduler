@@ -174,9 +174,21 @@ Lifecycle events carry `taskId`, `projectId`, `taskName` and `view`, where
 ```
 
 This builds and codesigns the binary, then registers it with Relay as an
-autostart service. relay supplies the front-door socket and token
-(`RELAY_FRONTEND_SOCKET`, `RELAY_FRONTEND_TOKEN`) and the bridge variables used
-for manifest registration. No flags are needed.
+autostart service with the `frontend` and `manifest` capabilities:
+
+```bash
+relay service register --name "Relay Scheduler" --command "$(pwd)/relayscheduler" \
+  --capability frontend --capability manifest --autostart
+```
+
+No flags are needed, and relay puts no credential in the environment. It
+passes a one-time launch secret on fd 3 (`RELAY_LAUNCH_FD=3`), which the
+scheduler reads and presents in a `Hello` on `RELAY_BRIDGE_SOCKET` before doing
+anything else. From then on relay recognises the process itself: manifest
+registration carries no token and front-door calls on `RELAY_FRONTEND_SOCKET`
+carry no `Authorization` header. If the secret or the Hello fails, the scheduler
+exits rather than running without relay. See relay's
+`docs/launch-identity.md`.
 
 ### Standalone
 
@@ -191,7 +203,7 @@ go build .
 | `--token` | `RELAY_SCHEDULER_TOKEN` | random, never logged | Bearer required by the API |
 | `--data-dir` | `RELAY_SCHEDULER_DATA` | `~/Library/Application Support/relayScheduler` (macOS), `~/.config/relayScheduler` (Linux) | Tasks and history |
 | `--relay-socket` | `RELAY_FRONTEND_SOCKET` | — | relay front-door socket |
-| `--relay-token` | `RELAY_FRONTEND_TOKEN` | — | relay front-door bearer |
+| `--relay-token` | `RELAY_FRONTEND_TOKEN` | — | relay front-door bearer (standalone only; ignored under relay) |
 | `--relay-url` | `RELAY_FRONTEND_URL` | `http://localhost:3000` | relay over TCP, when `--relay-socket` is empty |
 
 Set `--token` yourself when running standalone; an auto-generated token is
