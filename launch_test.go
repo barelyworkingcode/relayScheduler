@@ -290,7 +290,10 @@ func TestFrontendClient_LaunchedSendsNoAuthorization(t *testing.T) {
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	client := newFrontendClient(&launchIdentity{serviceID: "svc-1", relayPID: 1}, "http://localhost:3000", sock, "")
+	client, err := newFrontendClient(&launchIdentity{serviceID: "svc-1", relayPID: 1}, "http://localhost:3000", sock, "")
+	if err != nil {
+		t.Fatalf("newFrontendClient: %v", err)
+	}
 	p, err := client.GetProject("p1")
 	if err != nil {
 		t.Fatalf("GetProject: %v", err)
@@ -313,12 +316,22 @@ func TestFrontendClient_LaunchedSendsNoAuthorization(t *testing.T) {
 }
 
 func TestNewFrontendClient_LaunchedIgnoresExplicitToken(t *testing.T) {
-	c := newFrontendClient(&launchIdentity{serviceID: "svc-1", relayPID: 1}, "http://localhost:3000", "/tmp/x.sock", "explicit")
-	if c.token != "" {
-		t.Fatal("launched client kept a frontend bearer")
+	c, err := newFrontendClient(&launchIdentity{serviceID: "svc-1", relayPID: 1}, "http://localhost:3000", "/tmp/x.sock", "explicit")
+	if err != nil || c.token != "" {
+		t.Fatalf("launched client: err %v, kept bearer %v", err, c != nil && c.token != "")
 	}
-	c = newFrontendClient(nil, "http://localhost:3000", "/tmp/x.sock", "explicit")
-	if c.token != "explicit" {
+	c, err = newFrontendClient(nil, "http://localhost:3000", "/tmp/x.sock", "explicit")
+	if err != nil || c.token != "explicit" {
 		t.Fatal("standalone client dropped its explicit bearer")
+	}
+}
+
+func TestNewFrontendClient_SocketRequiredOnlyUnderRelay(t *testing.T) {
+	if _, err := newFrontendClient(&launchIdentity{serviceID: "svc-1", relayPID: 1}, "http://localhost:3000", "", ""); err == nil {
+		t.Fatal("launched client accepted a missing frontend socket")
+	}
+	c, err := newFrontendClient(nil, "http://localhost:3000", "", "explicit")
+	if err != nil || c.socketPath != "" || c.token != "explicit" {
+		t.Fatalf("standalone TCP client refused: %v", err)
 	}
 }

@@ -186,8 +186,9 @@ passes a one-time launch secret on fd 3 (`RELAY_LAUNCH_FD=3`), which the
 scheduler reads and presents in a `Hello` on `RELAY_BRIDGE_SOCKET` before doing
 anything else. From then on relay recognises the process itself: manifest
 registration carries no token and front-door calls on `RELAY_FRONTEND_SOCKET`
-carry no `Authorization` header. If the secret or the Hello fails, the scheduler
-exits rather than running without relay. See relay's
+carry no `Authorization` header. If the secret or the Hello fails, or relay
+supplied no `RELAY_FRONTEND_SOCKET` (the service lacks the `frontend`
+capability), the scheduler exits rather than running without relay. See relay's
 `docs/launch-identity.md`.
 
 ### Standalone

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -27,7 +28,7 @@ func main() {
 	}
 
 	relayURL := flag.String("relay-url", envOrDefault("RELAY_FRONTEND_URL", "http://localhost:3000"), "relay HTTP base URL (used only when --relay-socket is empty)")
-	relaySocket := flag.String("relay-socket", envOrDefault("RELAY_FRONTEND_SOCKET", ""), "relay frontend Unix socket path (preferred when running under the relay orchestrator)")
+	relaySocket := flag.String("relay-socket", envOrDefault(envFrontendSocket, ""), "relay frontend Unix socket path (preferred when running under the relay orchestrator)")
 	relayToken := flag.String("relay-token", envOrDefault("RELAY_FRONTEND_TOKEN", ""), "Bearer token for relay's frontend API (standalone only; ignored when launched by relay)")
 	dataDir := flag.String("data-dir", envOrDefault("RELAY_SCHEDULER_DATA", ""), "Data directory for tasks and logs")
 	socketPath := flag.String("socket", envOrDefault("RELAY_SCHEDULER_SOCKET", ""), "Unix socket this service listens on. Defaults to {data-dir}/relayscheduler.sock. relay learns the path via manifest registration; standalone clients dial it directly.")
@@ -67,7 +68,7 @@ func main() {
 	zone, offset := time.Now().Zone()
 	slog.Info("system timezone", "zone", zone, "offsetSeconds", offset)
 
-	client := newFrontendClient(identity, *relayURL, *relaySocket, *relayToken)
+	client := mustFrontendClient(identity, *relayURL, *relaySocket, *relayToken)
 	store := NewTaskStore(*dataDir)
 	logStore := NewLogStore(filepath.Join(*dataDir, "task-logs"))
 	hub := NewHub(store)
@@ -128,21 +129,33 @@ func main() {
 	scheduler.Stop()
 }
 
+// mustFrontendClient exits when newFrontendClient refuses: a relay-launched
+// scheduler without its frontend socket cannot run a task.
+func mustFrontendClient(identity *launchIdentity, relayURL, relaySocket, relayToken string) *RelayClient {
+	client, err := newFrontendClient(identity, relayURL, relaySocket, relayToken)
+	if err != nil {
+		slog.Error("relay frontend unavailable; exiting", "error", err)
+		os.Exit(1)
+	}
+	return client
+}
+
 // newFrontendClient drops any frontend bearer when launched by relay: relay
 // authenticates this process by its peer audit token only on requests with
 // no Authorization header, and judges a request that carries one as that
-// bearer instead.
-func newFrontendClient(identity *launchIdentity, relayURL, relaySocket, relayToken string) *RelayClient {
+// bearer instead. Under relay the socket is mandatory; the TCP fallback would
+// carry no credential at all.
+func newFrontendClient(identity *launchIdentity, relayURL, relaySocket, relayToken string) (*RelayClient, error) {
 	if identity != nil {
+		if relaySocket == "" {
+			return nil, fmt.Errorf("launched by relay without %s: service %q is not registered with the frontend capability", envFrontendSocket, identity.serviceID)
+		}
 		if relayToken != "" {
 			slog.Warn("ignoring --relay-token: launched by relay, which authenticates this process by identity")
 		}
-		if relaySocket == "" {
-			slog.Warn("launched by relay without RELAY_FRONTEND_SOCKET; frontend calls will not be authenticated")
-		}
 		relayToken = ""
 	}
-	return NewRelayClient(relayURL, relaySocket, relayToken)
+	return NewRelayClient(relayURL, relaySocket, relayToken), nil
 }
 
 func envOrDefault(key, fallback string) string {

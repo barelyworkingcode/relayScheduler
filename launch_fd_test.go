@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -63,6 +64,66 @@ func TestBootstrapLaunchIdentity_RealFD3(t *testing.T) {
 			}
 		})
 	}
+}
+
+const envHelperFrontend = "RELAYSCHEDULER_TEST_HELPER_FRONTEND"
+
+// TestLaunchedWithoutFrontendSocket_Exits runs the real startup path in a
+// child with a valid launch and no RELAY_FRONTEND_SOCKET: it must exit
+// non-zero with a log line naming the misregistration, not fall back to TCP.
+func TestLaunchedWithoutFrontendSocket_Exits(t *testing.T) {
+	fb := startFakeBridge(t, okHello("svc-1", 4242))
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString(testSecret)
+	w.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperFrontend$")
+	cmd.ExtraFiles = []*os.File{r}
+	env := []string{}
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, envFrontendSocket+"=") {
+			env = append(env, kv)
+		}
+	}
+	cmd.Env = append(env,
+		envHelperFrontend+"=1",
+		envLaunchFD+"=3",
+		envBridgeSocket+"="+fb.path,
+		envServiceID+"=svc-1",
+	)
+	out, err := cmd.CombinedOutput()
+	r.Close()
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+		t.Fatalf("helper did not exit non-zero: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "HELPER_CONTINUED") {
+		t.Fatalf("helper continued past the frontend check:\n%s", out)
+	}
+	if !strings.Contains(string(out), "relay frontend unavailable") || !strings.Contains(string(out), envFrontendSocket) {
+		t.Fatalf("missing fail-closed log line:\n%s", out)
+	}
+	if strings.Contains(string(out), testSecret) {
+		t.Fatalf("helper output contains the secret:\n%s", out)
+	}
+}
+
+// TestHelperFrontend is the child half of
+// TestLaunchedWithoutFrontendSocket_Exits and does nothing in a normal run.
+func TestHelperFrontend(t *testing.T) {
+	if os.Getenv(envHelperFrontend) != "1" {
+		t.Skip("helper process only")
+	}
+	id, err := bootstrapLaunchIdentity()
+	if err != nil || id == nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	mustFrontendClient(id, "http://localhost:3000", os.Getenv(envFrontendSocket), "")
+	os.Stdout.WriteString("HELPER_CONTINUED\n")
 }
 
 // TestHelperBootstrap is the child half of TestBootstrapLaunchIdentity_RealFD3

@@ -24,6 +24,8 @@ const (
 	// relay/internal/bridge/types.go.
 	envBridgeSocket = "RELAY_BRIDGE_SOCKET"
 	envServiceID    = "RELAY_SERVICE_ID"
+	// Set only for services registered with the frontend capability.
+	envFrontendSocket = "RELAY_FRONTEND_SOCKET"
 
 	// Must stay in sync with relay/internal/bridge/types.go.
 	reqRegisterManifest = "RegisterManifest"

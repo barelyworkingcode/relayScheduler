@@ -69,6 +69,8 @@ relayScheduler is a relay-enhanced service (protocol: `../relay/docs/service-man
 - **Outbound.** To run a task, the scheduler dials relay's front door
   (`RELAY_FRONTEND_SOCKET`), which routes sessions and terminals to relayLLM.
   Under relay it is authenticated by identity and `--relay-token` is ignored;
+  a relay-launched scheduler with no `RELAY_FRONTEND_SOCKET` is misregistered
+  (no `frontend` capability) and exits non-zero rather than falling back to TCP;
   standalone it presents `--relay-token` / `RELAY_FRONTEND_TOKEN` as a bearer.
   Projects are referenced by id only; relay brokers the project-scoped token.
 
