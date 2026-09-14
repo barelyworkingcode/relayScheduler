@@ -5,18 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"time"
 )
 
-// Minimal client for relay's bridge Unix socket. relayScheduler makes one call,
-// RegisterManifest, so relay's front-door dispatcher routes /api/tasks* and
-// /ws/tasks to this process. Wire format mirrors relay/internal/bridge:
-// newline-delimited JSON, one request, one response.
+// Minimal client for relay's bridge Unix socket. After Hello (launch.go),
+// relayScheduler makes one call, RegisterManifest, so relay's front-door
+// dispatcher routes /api/tasks* and /ws/tasks to this process. Wire format
+// mirrors relay/internal/bridge: newline-delimited JSON, one request, one
+// response.
 //
 // The types are mirrored rather than imported because relay is a separate Go
-// module and the surface needed here is tiny. Same pattern as
-// ../relayLLM/relay_bridge_client.go.
+// module and the surface needed here is tiny.
 
 const (
 	relayBridgeTimeout = 5 * time.Second
@@ -25,22 +24,19 @@ const (
 	// relay/internal/bridge/types.go.
 	envBridgeSocket = "RELAY_BRIDGE_SOCKET"
 	envServiceID    = "RELAY_SERVICE_ID"
-
-	// envServiceToken is the full-access service token that authenticates
-	// bridge calls. It is NOT a project token and must never reach a spawned
-	// child. relay still injects the pre-rename envServiceTokenLegacy alongside
-	// it; drop the fallback once relay stops.
-	envServiceToken       = "RELAY_SERVICE_TOKEN"
-	envServiceTokenLegacy = "RELAY_MCP_TOKEN"
+	// Set only for services registered with the frontend capability.
+	envFrontendSocket = "RELAY_FRONTEND_SOCKET"
 
 	// Must stay in sync with relay/internal/bridge/types.go.
 	reqRegisterManifest = "RegisterManifest"
 	respError           = "Error"
 )
 
+// relayBridgeRequest has no token field on purpose: relay authenticates a
+// tokenless request by the connection's peer audit token, bound at Hello. A
+// token on the wire would be judged as that token instead.
 type relayBridgeRequest struct {
 	Type      string          `json:"type"`
-	Token     string          `json:"token,omitempty"`
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 
@@ -50,22 +46,10 @@ type relayBridgeResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func serviceToken() string {
-	if t := os.Getenv(envServiceToken); t != "" {
-		return t
-	}
-	return os.Getenv(envServiceTokenLegacy)
-}
-
 // sendBridgeRequest dials relay's bridge, writes one request, and reads one
 // response. A bridge Error reply is returned as an error.
 func sendBridgeRequest(socketPath, reqType string, args json.RawMessage) error {
-	token := serviceToken()
-	if token == "" {
-		return fmt.Errorf("%s not set in environment", envServiceToken)
-	}
-
-	payload, err := json.Marshal(relayBridgeRequest{Type: reqType, Token: token, Arguments: args})
+	payload, err := json.Marshal(relayBridgeRequest{Type: reqType, Arguments: args})
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
 	}
