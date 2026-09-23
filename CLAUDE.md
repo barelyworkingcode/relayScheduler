@@ -2,7 +2,7 @@
 
 Task scheduling service. Stores tasks in a single `tasks.json`, runs them on
 schedule by creating sessions/terminals through relay's front door (which routes
-them to relayLLM), and broadcasts task lifecycle events over WebSocket.
+them to relay-sessions), and broadcasts task lifecycle events over WebSocket.
 
 **README.md is the reference for task types, schedules, missed-run rules, the
 run history record, API, and WS events.** Keep it in sync when behavior changes.
@@ -67,7 +67,7 @@ relayScheduler is a relay-enhanced service (protocol: `../relay/docs/service-man
 - **Standalone** (no `RELAY_LAUNCH_FD`): no Hello, registration is a no-op; the
   listener still serves direct clients.
 - **Outbound.** To run a task, the scheduler dials relay's front door
-  (`RELAY_FRONTEND_SOCKET`), which routes sessions and terminals to relayLLM.
+  (`RELAY_FRONTEND_SOCKET`), which routes sessions and terminals to relay-sessions.
   Under relay it is authenticated by identity and `--relay-token` is ignored;
   a relay-launched scheduler with no `RELAY_FRONTEND_SOCKET` is misregistered
   (no `frontend` capability) and exits non-zero rather than falling back to TCP;
@@ -130,8 +130,9 @@ Keep `gofmt -l .` empty; `.gitattributes` forces LF on `.go` files.
 
 - `../relay/` — orchestrator. Spawns relayScheduler, dispatches `/api/tasks*` and
   `/ws/tasks` to it via the registered manifest, and brokers project tokens.
-- `../relayLLM/` — LLM engine. The sessions/terminals a task runs in execute here
-  (reached through relay's front door, not directly). Terminal templates live in
-  its `settings.json` `pty` section.
+- `../relay/` relay-sessions — the sessions/terminals a task runs in execute here
+  (reached through relay's front door, not directly).
+- `../relayLLM/` — model host. Terminal templates live in its `settings.json`
+  `pty` section, which relay-sessions reads.
 - `../eve/` — frontend. Reaches the task API through relay and bridges `/ws/tasks`
   to the browser for live task badges.
