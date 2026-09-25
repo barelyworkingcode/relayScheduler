@@ -81,8 +81,9 @@ relayScheduler is a relay-enhanced service (protocol: `../relay/docs/service-man
 2. Every 30s, `checkAndFireTasks` fires due tasks. A run more than
    `missedThreshold` (10m) late is skipped unless `CatchUp`; a skipped `once`
    task is disabled. The `running` set prevents a task overlapping itself.
-3. `executeTask` deletes the previous run's session/terminal, resolves the
-   project, then:
+3. `executeTask` deletes the previous run's session/terminal. A chat task with
+   a blank `model` fails here through `failRun`; there is no fallback model.
+   Otherwise it resolves the project, then:
    - **chat** → `CreateSession` (headless), then `RunChatAndWait` drives the turn
      over WS until `message_complete`, capped by `MaxDurationSeconds` (default
      30m). WS, not the blocking POST /message, because relayLLM caps that at 5
