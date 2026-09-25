@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
-// validateTask enforces what a runnable task needs. Chat tasks need Prompt;
-// PTY tasks need TemplateID. An empty SessionType is treated as "headless" for
-// task records that predate PTY support.
+// validateTask enforces what a runnable task needs. Chat tasks need Prompt and
+// Model; PTY tasks need TemplateID. An empty SessionType is treated as
+// "headless" for task records that predate PTY support.
 func validateTask(task Task) error {
 	if task.Name == "" {
 		return errors.New("name is required")
@@ -31,6 +32,9 @@ func validateTask(task Task) error {
 	case "", SessionTypeChat:
 		if task.Prompt == "" {
 			return errors.New("prompt is required for chat tasks")
+		}
+		if strings.TrimSpace(task.Model) == "" {
+			return fmt.Errorf("task %q: model is required for chat tasks", task.Name)
 		}
 	default:
 		return fmt.Errorf("invalid sessionType %q (expected \"headless\" or \"pty\")", task.SessionType)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -240,6 +241,11 @@ func (s *Scheduler) executeTask(task Task) {
 
 	// Mark task as running so clients can detect in-progress execution.
 	s.store.SetLastRun(task.ID, "running")
+
+	if task.SessionType != SessionTypePTY && strings.TrimSpace(task.Model) == "" {
+		s.failRun(task, exec, fmt.Errorf("task %q has no model; edit the task and choose one", task.Name))
+		return
+	}
 
 	// Resolve the project so we can pass `directory` + `projectId` to relayLLM
 	// — relayLLM is a pure execution engine and has no project awareness; relay

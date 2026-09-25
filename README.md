@@ -39,8 +39,8 @@ flowchart LR
 | | Chat (`"sessionType": "headless"`, the default) | Terminal (`"sessionType": "pty"`) |
 |---|---|---|
 | What runs | `prompt` is sent to a new headless LLM session in the project | A relayLLM terminal template (`templateId`) with `extraArgs` appended |
-| Required | `prompt` | `templateId` |
-| Optional | `model` | `extraArgs`, `directory` (defaults to the project path) |
+| Required | `prompt`, `model` | `templateId` |
+| Optional | | `extraArgs`, `directory` (defaults to the project path) |
 | Succeeds when | The turn completes | The process exits 0 |
 | History records | Reply text, token and cost stats | Exit code, last 16 KB of terminal output |
 | eve opens the run as | An interactive session you can keep chatting in | A read-only terminal: live while running, replayed from the log after |
@@ -115,6 +115,9 @@ runs `npm test`.
   next one starts.
 - **Timeouts.** A chat run past `maxDurationSeconds` is stopped and recorded as
   `timeout`. A terminal run past it is killed.
+- **No model.** A chat task stored with a blank `model` (from before the API
+  required one) is not given a fallback. Each run fails as `task_error` with
+  the reason in history, until the task is edited to name a model.
 - If the scheduler dies mid-run, the task's last status is reset to `error` on
   startup. That run has no history entry.
 
