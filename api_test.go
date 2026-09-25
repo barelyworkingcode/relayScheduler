@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-const chatTaskJSON = `{"name":"digest","projectId":"p1","prompt":"summarize","enabled":true,"schedule":{"type":"interval","minutes":15}}`
+const chatTaskJSON = `{"name":"digest","projectId":"p1","prompt":"summarize","model":"haiku","enabled":true,"schedule":{"type":"interval","minutes":15}}`
 
 func newTestAPI(t *testing.T) http.Handler {
 	t.Helper()
@@ -97,7 +97,7 @@ func TestAPI_RejectsInvalidTasksOnCreateAndUpdate(t *testing.T) {
 		{"invalid JSON", `{`},
 		{"missing schedule", `{"name":"digest","projectId":"p1","prompt":"summarize"}`},
 		{"unknown schedule type", `{"name":"digest","projectId":"p1","prompt":"summarize","schedule":{"type":"bogus"}}`},
-		{"chat task without prompt", `{"name":"digest","projectId":"p1","schedule":{"type":"interval","minutes":15}}`},
+		{"chat task without prompt", `{"name":"digest","projectId":"p1","model":"haiku","schedule":{"type":"interval","minutes":15}}`},
 		{"pty task without template", `{"name":"build","projectId":"p1","sessionType":"pty","schedule":{"type":"interval","minutes":15}}`},
 		{"unknown session type", `{"name":"x","projectId":"p1","prompt":"p","sessionType":"voice","schedule":{"type":"interval","minutes":15}}`},
 	} {
@@ -117,6 +117,30 @@ func TestAPI_RejectsInvalidTasksOnCreateAndUpdate(t *testing.T) {
 	if st, _ := ScheduleType(stored.Schedule); st != "interval" {
 		t.Errorf("stored schedule type = %q after rejected updates, want interval", st)
 	}
+}
+
+func TestAPI_ChatTaskRequiresModel(t *testing.T) {
+	h := newTestAPI(t)
+	created := createTask(t, h, chatTaskJSON)
+
+	for _, tc := range []struct{ name, body string }{
+		{"empty model", `{"name":"digest","projectId":"p1","prompt":"summarize","model":"","schedule":{"type":"interval","minutes":15}}`},
+		{"whitespace model, headless", `{"name":"digest","projectId":"p1","prompt":"summarize","sessionType":"headless","model":"   ","schedule":{"type":"interval","minutes":15}}`},
+	} {
+		for _, req := range []struct{ method, path string }{
+			{http.MethodPost, "/api/tasks"},
+			{http.MethodPut, "/api/tasks/" + created.ID},
+		} {
+			rec := serve(h, req.method, req.path, tc.body)
+			var body struct{ Error string }
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(body.Error, "digest") || !strings.Contains(body.Error, "model") {
+				t.Errorf("%s %s = %d %s, want 400 with an error naming the task and model", req.method, tc.name, rec.Code, rec.Body)
+			}
+		}
+	}
+
+	createTask(t, h, `{"name":"build","projectId":"p1","sessionType":"pty","templateId":"shell","schedule":{"type":"interval","minutes":15}}`)
 }
 
 func TestAPI_DeleteByProject(t *testing.T) {
