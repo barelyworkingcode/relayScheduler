@@ -90,10 +90,11 @@ func TestCheckAndFire_MissedRecurringTaskIsRescheduled(t *testing.T) {
 }
 
 func TestExecuteTask_ChatTaskWithoutModelFailsWithoutSession(t *testing.T) {
-	var sessionPosts atomic.Int32
+	var projectGets, sessionPosts atomic.Int32
 	frontDoor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/projects/p1":
+			projectGets.Add(1)
 			w.Write([]byte(`{"id":"p1","path":"/work"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/sessions":
 			sessionPosts.Add(1)
@@ -136,6 +137,9 @@ func TestExecuteTask_ChatTaskWithoutModelFailsWithoutSession(t *testing.T) {
 
 	s.executeTask(*task)
 
+	if n := projectGets.Load(); n != 0 {
+		t.Errorf("front door got %d GET /api/projects/p1, want 0", n)
+	}
 	if n := sessionPosts.Load(); n != 0 {
 		t.Errorf("front door got %d POST /api/sessions, want 0", n)
 	}
