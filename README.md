@@ -40,7 +40,7 @@ flowchart LR
 |---|---|---|
 | What runs | `prompt` is sent to a new headless LLM session in the project | A relayLLM terminal template (`templateId`) with `extraArgs` appended |
 | Required | `prompt`, `model` | `templateId` |
-| Optional | | `extraArgs`, `directory` (defaults to the project path) |
+| Optional | `useRelayTools` | `extraArgs`, `directory` (defaults to the project path) |
 | Succeeds when | The turn completes | The process exits 0 |
 | History records | Reply text, token and cost stats | Exit code, last 16 KB of terminal output |
 | eve opens the run as | An interactive session you can keep chatting in | A read-only terminal: live while running, replayed from the log after |
@@ -50,7 +50,10 @@ caps a run for either type; the default is 30 minutes.
 
 Headless chat sessions run without interactive permission prompts. relayLLM
 handles that, because the scheduler creates them with
-`settings: {"headless": true}`. Terminal templates live in relayLLM's
+`settings: {"headless": true}`. Set `"useRelayTools": true` on a chat task to let its session use the relay
+tools its project grants; the settings become
+`{"headless": true, "useRelayTools": true}`. It defaults to off, and tasks
+without it keep `{"headless": true}`. Terminal templates live in relayLLM's
 `settings.json` (`pty` section). The built-ins are `claude-code`, `opencode`
 and `shell`, so `{"templateId": "shell", "extraArgs": ["-c", "npm test"]}`
 runs `npm test`.

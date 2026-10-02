@@ -118,12 +118,23 @@ func (c *RelayClient) GetProject(projectID string) (*Project, error) {
 }
 
 func (c *RelayClient) CreateSession(project *Project, model, name string) (*SessionResponse, error) {
+	return c.CreateSessionWithTools(project, model, name, false)
+}
+
+// CreateSessionWithTools creates a headless session. useRelayTools adds
+// "useRelayTools":true to the settings so the session can use the relay tools
+// its project grants; false leaves the settings exactly {"headless":true}.
+func (c *RelayClient) CreateSessionWithTools(project *Project, model, name string, useRelayTools bool) (*SessionResponse, error) {
+	settings := map[string]bool{"headless": true}
+	if useRelayTools {
+		settings["useRelayTools"] = true
+	}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"projectId": project.ID,
 		"directory": project.Path,
 		"model":     model,
 		"name":      name,
-		"settings":  map[string]bool{"headless": true},
+		"settings":  settings,
 	})
 
 	req, err := c.newRequest(http.MethodPost, "/api/sessions", bytes.NewReader(payload))

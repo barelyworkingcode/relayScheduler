@@ -261,7 +261,7 @@ func (s *Scheduler) executeTask(task Task) {
 		return
 	}
 
-	session, err := s.client.CreateSession(project, task.Model, task.Name)
+	session, err := s.client.CreateSessionWithTools(project, task.Model, task.Name, task.UseRelayTools)
 	if err != nil {
 		s.failRun(task, exec, err)
 		return
