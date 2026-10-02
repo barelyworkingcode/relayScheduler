@@ -85,7 +85,8 @@ type Task struct {
 	LastRun       string          `json:"lastRun,omitempty"`
 	LastStatus    string          `json:"lastStatus,omitempty"` // "running", "success", "error", "timeout"
 	LastSessionID string          `json:"lastSessionId,omitempty"`
-	CatchUp       bool            `json:"catchUp"` // fire runs missed by more than missedThreshold instead of skipping them
+	UseRelayTools bool            `json:"useRelayTools,omitempty"` // chat tasks: let the session use the relay tools its project grants
+	CatchUp       bool            `json:"catchUp"`                 // fire runs missed by more than missedThreshold instead of skipping them
 
 	// PTY-mode fields. Zero-valued for legacy headless tasks; no migration
 	// needed. SessionType is "headless" (or "") for chat, "pty" for terminal.
