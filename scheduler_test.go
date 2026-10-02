@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -159,5 +160,61 @@ func TestExecuteTask_ChatTaskWithoutModelFailsWithoutSession(t *testing.T) {
 	}
 	if frame["taskName"] != task.Name {
 		t.Errorf("task_error taskName = %v, want %q", frame["taskName"], task.Name)
+	}
+}
+
+func TestExecuteTask_SessionSettingsFollowUseRelayTools(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		useRelayTools bool
+		want          map[string]interface{}
+	}{
+		{"field absent", false, map[string]interface{}{"headless": true}},
+		{"useRelayTools true", true, map[string]interface{}{"headless": true, "useRelayTools": true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var bodies []map[string]interface{}
+			frontDoor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/projects/p1":
+					w.Write([]byte(`{"id":"p1","path":"/work"}`))
+				case r.Method == http.MethodPost && r.URL.Path == "/api/sessions":
+					var body map[string]interface{}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decode POST /api/sessions: %v", err)
+					}
+					bodies = append(bodies, body)
+					http.Error(w, "fake front door stops the run here", http.StatusInternalServerError)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer frontDoor.Close()
+
+			dir := t.TempDir()
+			store := NewTaskStore(dir)
+			s := NewScheduler(NewRelayClient(frontDoor.URL, "", ""), store, NewLogStore(filepath.Join(dir, "task-logs")), NewHub(store))
+			task, err := store.Create(Task{
+				Name:          "morning brief",
+				ProjectID:     "p1",
+				Prompt:        "summarize",
+				Model:         "haiku",
+				Enabled:       true,
+				Schedule:      json.RawMessage(`{"type":"interval","minutes":15}`),
+				UseRelayTools: tc.useRelayTools,
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			s.executeTask(*task)
+
+			if len(bodies) != 1 {
+				t.Fatalf("front door got %d POST /api/sessions, want 1", len(bodies))
+			}
+			if got := bodies[0]["settings"]; !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("session settings = %v, want exactly %v", got, tc.want)
+			}
+		})
 	}
 }

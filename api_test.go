@@ -162,3 +162,46 @@ func TestAPI_DeleteByProject(t *testing.T) {
 		t.Errorf("remaining = %+v, want the single p2 task", remaining)
 	}
 }
+
+func TestAPI_UseRelayToolsRoundTrips(t *testing.T) {
+	h := newTestAPI(t)
+	withTools := strings.Replace(chatTaskJSON, `"enabled":true`, `"enabled":true,"useRelayTools":true`, 1)
+
+	// stored reads useRelayTools off GET /api/tasks/{id}; present is false
+	// when the key is absent from the wire JSON.
+	stored := func(id string) (value, present bool) {
+		t.Helper()
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(serve(h, http.MethodGet, "/api/tasks/"+id, "").Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode GET task: %v", err)
+		}
+		raw, ok := got["useRelayTools"]
+		return string(raw) == "true", ok
+	}
+
+	plain := createTask(t, h, chatTaskJSON)
+	if _, present := stored(plain.ID); present {
+		t.Error("task created without useRelayTools has the key on GET, want it absent")
+	}
+
+	created := createTask(t, h, withTools)
+	if v, _ := stored(created.ID); !v {
+		t.Error("POST useRelayTools:true, GET does not return true")
+	}
+
+	for _, step := range []struct {
+		body string
+		want bool
+	}{
+		{chatTaskJSON, false},
+		{withTools, true},
+	} {
+		if rec := serve(h, http.MethodPut, "/api/tasks/"+created.ID, step.body); rec.Code != http.StatusOK {
+			t.Fatalf("PUT = %d %s, want 200", rec.Code, rec.Body)
+		}
+		v, present := stored(created.ID)
+		if v != step.want || (!step.want && present) {
+			t.Errorf("after PUT useRelayTools=%v, GET value=%v present=%v", step.want, v, present)
+		}
+	}
+}
