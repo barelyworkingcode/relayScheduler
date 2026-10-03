@@ -42,7 +42,7 @@ func (f *ptyRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"id": "p1", "path": f.dir})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/terminals":
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"id":"term1"}`))
+		w.Write([]byte(`{"terminalId":"term1"}`))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/terminals/term1/log":
 		w.Write([]byte("noise\r\n"))
 	case r.URL.Path == "/ws":
