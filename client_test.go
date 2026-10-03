@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -115,7 +116,7 @@ func TestCreateTerminal_PayloadShape(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"id":         "deadbeef-dead-beef-dead-beefdeadbeef",
+			"terminalId": "deadbeef-dead-beef-dead-beefdeadbeef",
 			"templateId": "shell",
 			"name":       "test",
 			"directory":  "/tmp",
@@ -238,4 +239,97 @@ func TestRunChatAndWait_Timeout(t *testing.T) {
 	if !errors.Is(err, ErrChatTimeout) {
 		t.Fatalf("err = %v, want ErrChatTimeout", err)
 	}
+}
+
+// TestRunTaskNow_PtyRunLearnsExitFromCreatedTerminal drives a PTY run against
+// a stub relay that answers POST /api/terminals in relay's shape and sends
+// terminal_exit only to a join for the terminal it created.
+func TestRunTaskNow_PtyRunLearnsExitFromCreatedTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		created    string
+		wantStatus string
+		wantExit   int
+	}{
+		{"terminalId in response", `{"terminalId":"t1"}`, "success", 0},
+		{"no id in response", `{}`, "error", ExitCodeCreateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/projects/p1":
+					w.Write([]byte(`{"id":"p1","path":"/work"}`))
+				case r.Method == http.MethodPost && r.URL.Path == "/api/terminals":
+					w.WriteHeader(http.StatusCreated)
+					w.Write([]byte(tc.created))
+				case r.URL.Path == "/ws":
+					conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					var join map[string]string
+					if conn.ReadJSON(&join) != nil {
+						return
+					}
+					if join["type"] == "join_terminal" && join["terminalId"] == "t1" {
+						_ = conn.WriteJSON(map[string]interface{}{"type": "terminal_exit", "exitCode": 0})
+						return
+					}
+					// relay ignores a join for an unknown terminal: no frame back.
+					_, _, _ = conn.ReadMessage()
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer relay.Close()
+
+			dir := t.TempDir()
+			store := NewTaskStore(dir)
+			logStore := NewLogStore(filepath.Join(dir, "task-logs"))
+			s := NewScheduler(NewRelayClient(relay.URL, "", ""), store, logStore, NewHub(store))
+			task, err := store.Create(Task{
+				Name:               "nightly script",
+				ProjectID:          "p1",
+				SessionType:        SessionTypePTY,
+				TemplateID:         "shell",
+				Enabled:            true,
+				Schedule:           json.RawMessage(`{"type":"on_demand"}`),
+				MaxDurationSeconds: 2,
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			start := time.Now()
+			if err := s.RunTaskNow(task.ID); err != nil {
+				t.Fatalf("RunTaskNow: %v", err)
+			}
+			var history []Execution
+			for time.Since(start) < 5*time.Second {
+				if history = logStore.Load("p1", task.ID); len(history) > 0 {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			elapsed := time.Since(start)
+			if len(history) != 1 {
+				t.Fatalf("history = %+v, want one finished run", history)
+			}
+			run := history[0]
+			if run.Status != tc.wantStatus || run.ExitCode == nil || *run.ExitCode != tc.wantExit {
+				t.Errorf("run status = %q exit = %v (error %q), want %q exit %d", run.Status, derefExit(run.ExitCode), run.Error, tc.wantStatus, tc.wantExit)
+			}
+			if elapsed > time.Second {
+				t.Errorf("run took %s, want under 1s (maxDurationSeconds is 2)", elapsed)
+			}
+		})
+	}
+}
+
+func derefExit(code *int) interface{} {
+	if code == nil {
+		return nil
+	}
+	return *code
 }
