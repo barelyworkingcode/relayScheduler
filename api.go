@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 )
 
@@ -23,6 +24,18 @@ func validateTask(task Task) error {
 	}
 	if err := ValidateSchedule(task.Schedule); err != nil {
 		return fmt.Errorf("invalid schedule: %w", err)
+	}
+	if task.OutputFile != "" {
+		if task.SessionType != SessionTypePTY {
+			return errors.New("outputFile is only for PTY tasks")
+		}
+		f := task.OutputFile
+		if filepath.Base(f) != f || f == "." || f == ".." || strings.ContainsAny(f, "/\\\x00") {
+			return errors.New("outputFile must be a file name, not a path")
+		}
+		if task.Directory != "" {
+			return errors.New("outputFile needs the task to run in its project directory; remove directory")
+		}
 	}
 	switch task.SessionType {
 	case SessionTypePTY:

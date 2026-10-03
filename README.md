@@ -40,9 +40,9 @@ flowchart LR
 |---|---|---|
 | What runs | `prompt` is sent to a new headless LLM session in the project | A relayLLM terminal template (`templateId`) with `extraArgs` appended |
 | Required | `prompt`, `model` | `templateId` |
-| Optional | `useRelayTools` | `extraArgs`, `directory` (defaults to the project path) |
+| Optional | `useRelayTools` | `extraArgs`, `directory` (defaults to the project path), `outputFile` |
 | Succeeds when | The turn completes | The process exits 0 |
-| History records | Reply text, token and cost stats | Exit code, last 16 KB of terminal output |
+| History records | Reply text, token and cost stats | Exit code, last 16 KB of terminal output, and `output` when `outputFile` is set |
 | eve opens the run as | An interactive session you can keep chatting in | A read-only terminal: live while running, replayed from the log after |
 
 Every task also needs `name`, `projectId` and `schedule`. `maxDurationSeconds`
@@ -57,6 +57,18 @@ without it keep `{"headless": true}`. Terminal templates live in relayLLM's
 `settings.json` (`pty` section). The built-ins are `claude-code`, `opencode`
 and `shell`, so `{"templateId": "shell", "extraArgs": ["-c", "npm test"]}`
 runs `npm test`.
+
+### Output file
+
+A terminal task can set `outputFile` to a bare file name (no `/`, `\`, or `..`)
+in the project directory. When the run exits 0, the scheduler reads that file
+and records its exact text as `output` on the run, next to `response` (the raw
+terminal tail). The file must have been written during the run, be a regular
+file (a symlink is refused), and be at most 64 KB. Otherwise the run fails
+with `output file not produced`, `output file is a symlink`,
+`output file is not a regular file` or `output file is over the 64 KB cap`.
+A non-zero exit or a timeout records no `output`. `outputFile` is rejected
+with a 400 on chat tasks and together with `directory`.
 
 ### Examples
 

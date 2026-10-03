@@ -205,3 +205,57 @@ func TestAPI_UseRelayToolsRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+const ptyTaskJSON = `{"name":"today","projectId":"p1","sessionType":"pty","templateId":"shell","extraArgs":["-c","true"],"enabled":true,"schedule":{"type":"on_demand"}}`
+
+// withFields appends JSON members (each with a leading comma) to a task body.
+func withFields(body, fields string) string {
+	return strings.TrimSuffix(body, "}") + fields + "}"
+}
+
+func TestAPI_OutputFileRoundTrips(t *testing.T) {
+	h := newTestAPI(t)
+	created := createTask(t, h, withFields(ptyTaskJSON, `,"outputFile":"today.json"`))
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(serve(h, http.MethodGet, "/api/tasks/"+created.ID, "").Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode GET task: %v", err)
+	}
+	if got["outputFile"] != "today.json" {
+		t.Errorf("GET outputFile = %v, want today.json", got["outputFile"])
+	}
+}
+
+func TestAPI_RejectsBadOutputFileOnCreateAndUpdate(t *testing.T) {
+	h := newTestAPI(t)
+	created := createTask(t, h, withFields(ptyTaskJSON, `,"outputFile":"today.json"`))
+
+	const notAName = "outputFile must be a file name, not a path"
+	named := func(name string) string { return withFields(ptyTaskJSON, `,"outputFile":"`+name+`"`) }
+	for _, tc := range []struct{ name, body, want string }{
+		{"parent escape", named("../x"), notAName},
+		{"subdirectory", named("a/b"), notAName},
+		{"absolute", named("/abs"), notAName},
+		{"dot", named("."), notAName},
+		{"dot dot", named(".."), notAName},
+		{"backslash", named(`a\\b`), notAName},
+		{"NUL", named(`a\u0000b`), notAName},
+		{"chat task", withFields(chatTaskJSON, `,"outputFile":"today.json"`), "outputFile is only for PTY tasks"},
+		{"with directory", withFields(ptyTaskJSON, `,"outputFile":"today.json","directory":"/work"`),
+			"outputFile needs the task to run in its project directory; remove directory"},
+	} {
+		for _, req := range []struct{ method, path string }{
+			{http.MethodPost, "/api/tasks"},
+			{http.MethodPut, "/api/tasks/" + created.ID},
+		} {
+			rec := serve(h, req.method, req.path, tc.body)
+			var body struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			if rec.Code != http.StatusBadRequest || body.Error != tc.want {
+				t.Errorf("%s %s = %d %q, want 400 %q", req.method, tc.name, rec.Code, body.Error, tc.want)
+			}
+		}
+	}
+}

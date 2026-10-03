@@ -29,7 +29,7 @@ auth.go               Bearer-auth middleware + token generation for the inbound 
 
 ## Task model in one paragraph
 
-Two task types. **Chat** (`sessionType` `"headless"` or empty) creates a headless
+Two task types. (A PTY task may set `outputFile`; `output.go` reads it on exit 0 into `Execution.Output`.) **Chat** (`sessionType` `"headless"` or empty) creates a headless
 relayLLM session and sends `prompt`. **PTY** (`"pty"`) launches a relayLLM
 terminal template (`templateId` + `extraArgs`) and waits for its exit code. Both
 share scheduling, history (`Execution`), and the `view` envelope eve dispatches

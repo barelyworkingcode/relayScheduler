@@ -96,6 +96,7 @@ type Task struct {
 	Directory          string   `json:"directory,omitempty"` // optional override of project.Path
 	MaxDurationSeconds int      `json:"maxDurationSeconds,omitempty"`
 	LastTerminalID     string   `json:"lastTerminalId,omitempty"`
+	OutputFile         string   `json:"outputFile,omitempty"` // bare file name in the project directory; captured as Execution.Output on exit 0
 }
 
 type DailySchedule struct {
@@ -152,4 +153,5 @@ type Execution struct {
 	// distinguishable from "no exit code captured".
 	TerminalID string `json:"terminalId,omitempty"`
 	ExitCode   *int   `json:"exitCode,omitempty"`
+	Output     string `json:"output,omitempty"` // contents of the task's outputFile, success only
 }

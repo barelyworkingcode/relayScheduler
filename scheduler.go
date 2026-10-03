@@ -423,6 +423,7 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 	projectForTerminal := *project
 	projectForTerminal.Path = directory
 
+	runStart := time.Now()
 	term, err := s.client.CreateTerminal(&projectForTerminal, task.TemplateID, task.Name, task.ExtraArgs)
 	if err != nil {
 		s.failRun(task, exec, err)
@@ -472,6 +473,15 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 		}
 	case exitCode == 0:
 		exec.Status = "success"
+		if task.OutputFile != "" {
+			out, oerr := readOutputFile(directory, task.OutputFile, runStart)
+			if oerr != nil {
+				exec.Status = "error"
+				exec.Error = oerr.Error()
+			} else {
+				exec.Output = out
+			}
+		}
 	default:
 		exec.Status = "error"
 		exec.Error = fmt.Sprintf("process exited with code %d", exitCode)
