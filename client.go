@@ -283,7 +283,7 @@ func (c *RelayClient) DeleteSession(sessionID string) {
 // --- Terminal/PTY methods ---
 
 type TerminalResponse struct {
-	ID string `json:"id"`
+	ID string `json:"terminalId"`
 }
 
 func (c *RelayClient) CreateTerminal(project *Project, templateID, name string, extraArgs []string) (*TerminalResponse, error) {
@@ -315,6 +315,9 @@ func (c *RelayClient) CreateTerminal(project *Project, templateID, name string, 
 	var out TerminalResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
+	}
+	if out.ID == "" {
+		return nil, fmt.Errorf("create terminal: response has no terminalId")
 	}
 	return &out, nil
 }
