@@ -239,12 +239,12 @@ func run() int {
 
 	// The service can be rebuilt or restarted while this run queued for the
 	// lock, so the build check is repeated once the lock is held.
-	if detail, berr := checkBuild(head); berr != nil {
+	detail, berr := checkBuild(head)
+	if berr != nil {
 		emit("PREFLIGHT", "build", "FAIL", berr.Error())
 		return 2 // deferred release runs
-	} else {
-		emit("PREFLIGHT", "build", "OK", detail+" (after lock)")
 	}
+	emit("PREFLIGHT", "build", "OK", detail+" (after lock)")
 
 	nonce := make([]byte, 4)
 	_, _ = rand.Read(nonce)

@@ -16,8 +16,9 @@ under test and refuses a mismatch.
 - `--post PR` posts an evidence comment and the `devbox/verify` commit status.
   The PR head must equal the checkout HEAD.
 
-Exit codes: 0 all journeys pass; 1 any FAIL or BLOCKED; 2 usage, preflight or
-post failure.
+Exit codes: 0 when at least one journey ran and every journey passed; 1 on any
+FAIL, BLOCKED or not-run journey, or no PASS; 2 on usage, preflight or post
+failure, or an interrupted run (which posts nothing).
 
 ## Environment
 
@@ -38,11 +39,13 @@ The credential is never printed.
     TIMING journey <id> <ms>
     TIMING run <ms>
     SUMMARY pass= fail= blocked= notrun=
+    SUMMARY interrupted
     POSTED <state> <url>
 
 Preflight runs in this order and the first FAIL exits 2: `machine`, `session`,
 `head`, `build`, `app`, `credential`, `world`, `pr` (only with `--post`), then
-`lock`.
+`lock`, then `build` again, since the service may have been swapped while the
+run waited for the lock.
 
 The `lock` step takes the WORLD lock with `devlock take WORLD --wait` (waits at
 most 15 minutes) and releases it when the run ends, including on Ctrl-C.
