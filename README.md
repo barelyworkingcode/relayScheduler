@@ -238,6 +238,14 @@ curl --unix-socket ~/Library/Application\ Support/relayScheduler/relayscheduler.
 - `tasks.json`: every task definition, plus each task's last run state.
 - `task-logs/{projectId}-{taskId}.json`: run history, capped at 100 entries.
 
+## Verification
+
+`go run ./cmd/devboxverify --checkout <PR worktree> --post <N>` drives a
+terminal routine through relay's front door on the test machine and posts the
+`devbox/verify` status. Usage, environment and prerequisites:
+[cmd/devboxverify/README.md](./cmd/devboxverify/README.md). The features and
+the journeys that cover them: [docs/FEATURES.md](./docs/FEATURES.md).
+
 ## Ecosystem
 
 - **[Relay](https://github.com/barelyworkingcode/relay)**: orchestrator and

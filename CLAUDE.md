@@ -25,6 +25,7 @@ api.go                Task API on Go 1.22 method/wildcard mux patterns
 manifest.go           Front-door manifest (routes) + RegisterManifest call
 bridge.go             Minimal relay bridge client (tokenless; identity-authenticated) used for registration
 auth.go               Bearer-auth middleware + token generation for the inbound listener
+cmd/devboxverify/     Devbox verify harness (own package main, stdlib only); journeys live here
 ```
 
 ## Task model in one paragraph
@@ -124,6 +125,10 @@ their defaults.
 go build .        # plain build
 go test ./...     # hermetic: fake WS/HTTP servers, temp-dir stores
 ```
+
+`docs/FEATURES.md` is the feature map (each row names its simple door, power door and journey). Update it in the PR that adds or changes a feature.
+
+Verify harness (test machine): `go run ./cmd/devboxverify --checkout <PR worktree> --post <N>`.
 
 Keep `gofmt -l .` empty; `.gitattributes` forces LF on `.go` files.
 
