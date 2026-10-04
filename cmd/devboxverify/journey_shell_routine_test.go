@@ -37,6 +37,7 @@ func TestClassifyShellRun(t *testing.T) {
 	nonzero := `[{"status":"error","exitCode":3,"error":"exited 3\nmore"}]`
 	notOK := `[{"status":"timeout","exitCode":0,"response":"relayscheduler-verify-abcd1234"}]`
 	noMarker := `[{"status":"success","exitCode":0,"response":"something else\n"}]`
+	longer := `[{"status":"success","exitCode":0,"response":"echo relayscheduler-verify-abcd1234 done\n"}]`
 	cases := []struct {
 		name   string
 		ended  bool
@@ -50,6 +51,7 @@ func TestClassifyShellRun(t *testing.T) {
 		{"nonzero exit", true, nonzero, stateFail, "exit 3: exited 3"},
 		{"status not success", true, notOK, stateFail, "timeout"},
 		{"marker missing", true, noMarker, stateFail, "lacks the marker"},
+		{"marker inside a longer line", true, longer, stateFail, "lacks the marker"},
 		{"marker present", true, passJSON, statePass, ""},
 	}
 	for _, c := range cases {
@@ -188,7 +190,7 @@ func TestRunShellRoutinePass(t *testing.T) {
 	}
 }
 
-func TestRunShellRoutineCleansUpOnEveryOutcome(t *testing.T) {
+func TestRunShellRoutineCleansUpOnFailure(t *testing.T) {
 	fastPolling(t)
 	cases := []struct {
 		name      string

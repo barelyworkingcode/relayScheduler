@@ -53,7 +53,7 @@ type journey struct {
 // worldProjectKey is the devboxWorld project the journeys run in.
 const worldProjectKey = "acme"
 
-// vmCheck is a test seam only; the harness has no flag or env override for it.
+// vmCheck is the machine check readMarker runs; a variable only so it reads as one named step.
 var vmCheck = hostIsVM
 
 var home, _ = os.UserHomeDir()
@@ -97,7 +97,7 @@ func tally(rs []result) (counts map[state]int, exitCode int) {
 	for _, r := range rs {
 		counts[r.State]++
 	}
-	if counts[stateFail] > 0 || counts[stateBlocked] > 0 {
+	if counts[stateFail] > 0 || counts[stateBlocked] > 0 || counts[stateNotRun] > 0 || counts[statePass] == 0 {
 		exitCode = 1
 	}
 	return counts, exitCode
@@ -237,6 +237,15 @@ func run() int {
 	defer release()
 	emit("PREFLIGHT", "lock", "OK", "holding "+lockName)
 
+	// The service can be rebuilt or restarted while this run queued for the
+	// lock, so the build check is repeated once the lock is held.
+	if detail, berr := checkBuild(head); berr != nil {
+		emit("PREFLIGHT", "build", "FAIL", berr.Error())
+		return 2 // deferred release runs
+	} else {
+		emit("PREFLIGHT", "build", "OK", detail+" (after lock)")
+	}
+
 	nonce := make([]byte, 4)
 	_, _ = rand.Read(nonce)
 	e.Nonce = hex.EncodeToString(nonce)
@@ -250,6 +259,10 @@ func run() int {
 		results = append(results, r)
 		emit("JOURNEY", r.ID, string(r.State), r.Detail)
 		emit("TIMING", "journey", j.ID, strconv.FormatInt(time.Since(began).Milliseconds(), 10))
+	}
+	if ctx.Err() != nil {
+		emit("SUMMARY", "interrupted")
+		return 2
 	}
 	counts, code := tally(results)
 	runTime := time.Since(start)

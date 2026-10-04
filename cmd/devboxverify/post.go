@@ -45,7 +45,8 @@ func statusState(rs []result) string {
 	switch {
 	case counts[stateFail] > 0:
 		return "failure"
-	case counts[stateBlocked] > 0:
+	case counts[stateBlocked] > 0, counts[stateNotRun] > 0, counts[statePass] == 0:
+		// success needs at least one PASS and nothing left unrun.
 		return "error"
 	}
 	return "success"

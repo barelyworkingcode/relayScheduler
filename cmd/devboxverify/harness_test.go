@@ -46,6 +46,10 @@ func TestStatusState(t *testing.T) {
 	}{
 		{r(statePass), "success"},
 		{r(statePass, stateBlocked), "error"},
+		{nil, "error"},
+		{r(statePass, stateNotRun), "error"},
+		{r(stateNotRun), "error"},
+		{r(statePass, stateFail, stateNotRun), "failure"},
 		{r(stateBlocked, stateFail, statePass), "failure"},
 	}
 	for _, c := range cases {
@@ -90,5 +94,26 @@ func TestReadMarkerRefusals(t *testing.T) {
 	}
 	if _, err := readMarker(p, vm(true)); err != nil {
 		t.Errorf("valid marker on VM refused: %v", err)
+	}
+}
+
+func TestTallyExitCode(t *testing.T) {
+	cases := []struct {
+		in   []state
+		want int
+	}{
+		{[]state{statePass}, 0},
+		{nil, 1},
+		{[]state{statePass, stateNotRun}, 1},
+		{[]state{statePass, stateFail}, 1},
+	}
+	for _, c := range cases {
+		var rs []result
+		for _, s := range c.in {
+			rs = append(rs, result{State: s})
+		}
+		if _, code := tally(rs); code != c.want {
+			t.Errorf("%v: exit %d want %d", c.in, code, c.want)
+		}
 	}
 }
