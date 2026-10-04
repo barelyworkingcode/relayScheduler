@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -50,6 +51,11 @@ func TestValidTraceID(t *testing.T) {
 // newLoggedAPI serves the real task API behind traceMiddleware and captures
 // the default logger's output.
 func newLoggedAPI(t *testing.T) (http.Handler, *bytes.Buffer) {
+	h, buf, _ := newLoggedAPIDir(t)
+	return h, buf
+}
+
+func newLoggedAPIDir(t *testing.T) (http.Handler, *bytes.Buffer, string) {
 	t.Helper()
 	buf := &bytes.Buffer{}
 	prev := slog.Default()
@@ -60,7 +66,7 @@ func newLoggedAPI(t *testing.T) (http.Handler, *bytes.Buffer) {
 	logStore := NewLogStore(filepath.Join(dir, "task-logs"))
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, store, NewScheduler(nil, store, logStore, NewHub(store)), logStore)
-	return traceMiddleware(mux), buf
+	return traceMiddleware(mux), buf, dir
 }
 
 func createLine(t *testing.T, buf *bytes.Buffer) map[string]any {
@@ -100,6 +106,54 @@ func TestAPI_CreateLogsScheduleCreate(t *testing.T) {
 	if m["trace_id"] != "trace-abc12345" {
 		t.Errorf("trace_id = %v", m["trace_id"])
 	}
+}
+
+func TestAPI_FailedCreateLogsWarnOrError(t *testing.T) {
+	const canary = "CANARY-PROMPT-5d2e"
+	t.Run("invalid body is denied", func(t *testing.T) {
+		h, buf := newLoggedAPI(t)
+		req := httptest.NewRequest(http.MethodPost, "/api/tasks",
+			strings.NewReader(`{"prompt":"`+canary+`","schedule":{"type":"nope"}}`))
+		req.Header.Set("X-Trace-Id", "trace-bad12345")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400: %s", rec.Code, rec.Body)
+		}
+		m := createLine(t, buf)
+		if m["level"] != "warn" || m["status"] != "denied" || m["trace_id"] != "trace-bad12345" {
+			t.Errorf("bad line: %v", m)
+		}
+		if d, ok := m["duration_ms"].(float64); !ok || d < 0 {
+			t.Errorf("duration_ms %v", m["duration_ms"])
+		}
+		if strings.Contains(buf.String(), canary) {
+			t.Errorf("body leaked into log: %s", buf.String())
+		}
+	})
+	t.Run("store failure is an error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		h, buf, dir := newLoggedAPIDir(t)
+		if err := os.Chmod(dir, 0500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(dir, 0700) })
+		body := strings.Replace(chatTaskJSON, "summarize", canary, 1)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(body)))
+		if rec.Code < 500 {
+			t.Fatalf("status %d, want 5xx: %s", rec.Code, rec.Body)
+		}
+		m := createLine(t, buf)
+		if m["level"] != "error" || m["status"] != "error" || m["error"] == "" {
+			t.Errorf("bad line: %v", m)
+		}
+		if strings.Contains(buf.String(), canary) {
+			t.Errorf("body leaked into log: %s", buf.String())
+		}
+	})
 }
 
 func decodeTaskID(t *testing.T, body []byte) string {

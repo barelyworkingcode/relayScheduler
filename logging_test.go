@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -198,37 +200,92 @@ func TestLogger_DebugOffByDefault(t *testing.T) {
 }
 
 func TestLogger_DebugWindowExpires(t *testing.T) {
-	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	now := start
 	var buf bytes.Buffer
 	l := newLogger(&buf, "debug", func() time.Time { return now })
-	l.Debug("early-debug")
-	now = now.Add(debugWindow - time.Minute)
-	l.Debug("late-debug")
-	if n := strings.Count(buf.String(), "debug"); n < 2 {
+	l.Debug("debug-at-start")
+	now = start.Add(29*time.Minute + 59*time.Second)
+	l.Debug("debug-at-2959")
+	msgs := map[string]bool{}
+	for _, m := range parseLines(t, buf.String()) {
+		msgs[m["msg"].(string)] = true
+		if m["level"] != "debug" {
+			t.Errorf("unexpected line in window: %v", m)
+		}
+	}
+	if !msgs["debug-at-start"] || !msgs["debug-at-2959"] {
 		t.Fatalf("debug lines inside window missing: %s", buf.String())
 	}
 	buf.Reset()
-	now = now.Add(2 * time.Minute)
+	now = start.Add(30 * time.Minute)
 	l.Debug("expired-debug-1")
 	l.Debug("expired-debug-2")
 	l.Info("still-info")
-	lines := parseLines(t, buf.String())
-	warns, infos := 0, 0
-	for _, m := range lines {
+	var warns, infos []map[string]any
+	for _, m := range parseLines(t, buf.String()) {
 		switch m["level"] {
 		case "warn":
-			warns++
+			warns = append(warns, m)
 		case "info":
-			infos++
-		case "debug":
-			t.Errorf("debug line after window: %v", m)
+			infos = append(infos, m)
+		default:
+			t.Errorf("unexpected line after window: %v", m)
 		}
 	}
-	if warns != 1 || infos != 1 {
-		t.Errorf("warns=%d infos=%d, want 1 and 1: %s", warns, infos, buf.String())
+	if len(warns) != 1 || len(infos) != 1 || infos[0]["msg"] != "still-info" {
+		t.Fatalf("warns=%d infos=%d, want 1 and 1: %s", len(warns), len(infos), buf.String())
+	}
+	w := warns[0]
+	if w["op"] != "log.level" || w["status"] != "error" || w["error"] == "" {
+		t.Errorf("bad expiry warning: %v", w)
 	}
 	if strings.Contains(buf.String(), "expired-debug") {
 		t.Error("expired debug message leaked")
+	}
+}
+
+func TestInitLogging_ReadsLevelFromEnvAndWritesJSONToStderr(t *testing.T) {
+	prevLogger, prevStderr := slog.Default(), os.Stderr
+	t.Cleanup(func() { slog.SetDefault(prevLogger); os.Stderr = prevStderr })
+	run := func(level string) string {
+		t.Setenv("RELAY_LOG_LEVEL", level)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stderr = w
+		initLogging()
+		slog.Debug("dbg-line")
+		slog.Info("info-line")
+		w.Close()
+		os.Stderr = prevStderr
+		out, _ := io.ReadAll(r)
+		r.Close()
+		return string(out)
+	}
+	def := run("")
+	if strings.Contains(def, "dbg-line") || !strings.Contains(def, "info-line") {
+		t.Errorf("default level wrong: %s", def)
+	}
+	parseLines(t, def)
+	dbg := run("debug")
+	if !strings.Contains(dbg, "dbg-line") || !strings.Contains(dbg, "info-line") {
+		t.Errorf("RELAY_LOG_LEVEL=debug did not enable debug: %s", dbg)
+	}
+	parseLines(t, dbg)
+}
+
+func TestLogger_MultibyteTruncatesTo500Runes(t *testing.T) {
+	var buf bytes.Buffer
+	long := strings.Repeat("é世", 300) // 600 runes
+	newLogger(&buf, "info", fixedClock()).Info(long, "status", "error", "error", long)
+	m := parseLines(t, buf.String())[0]
+	for _, k := range []string{"msg", "error"} {
+		s := m[k].(string)
+		if !utf8.ValidString(s) || utf8.RuneCountInString(s) != 500 {
+			t.Errorf("%s: valid=%v runes=%d, want valid and 500", k, utf8.ValidString(s), utf8.RuneCountInString(s))
+		}
 	}
 }
 

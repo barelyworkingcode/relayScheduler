@@ -108,10 +108,16 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 		start := time.Now()
 		task, ok := decodeTask(w, r)
 		if !ok {
+			slog.WarnContext(r.Context(), "task create rejected",
+				"op", "schedule.create", "status", "denied",
+				"duration_ms", time.Since(start).Milliseconds(), "error", "invalid task")
 			return
 		}
 		created, err := store.Create(task)
 		if err != nil {
+			slog.ErrorContext(r.Context(), "task create failed",
+				"op", "schedule.create", "status", "error",
+				"duration_ms", time.Since(start).Milliseconds(), "error", "store create failed")
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

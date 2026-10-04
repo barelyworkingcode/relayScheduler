@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Relay logging standard: one JSON object per line on stderr, nine required
@@ -124,8 +125,8 @@ func (h *relayHandler) Enabled(_ context.Context, l slog.Level) bool {
 		st.write(map[string]any{
 			"ts": st.stamp(st.now()), "level": "warn",
 			"msg":     "debug logging ended after 30 minutes; level is now info",
-			"service": st.service, "op": "log.level", "status": "ok",
-			"duration_ms": 0, "error": "", "trace_id": "",
+			"service": st.service, "op": "log.level", "status": "error",
+			"duration_ms": 0, "error": "debug window expired", "trace_id": "",
 		})
 	}
 	return l >= st.level
@@ -179,19 +180,10 @@ func levelName(l slog.Level) string {
 }
 
 func clip(s string) string {
-	if len(s) <= maxLogText {
-		return s
+	if utf8.RuneCountInString(s) <= maxLogText {
+		return strings.ToValidUTF8(s, "\uFFFD")
 	}
-	r := []rune(s)
-	if len(r) > maxLogText {
-		r = r[:maxLogText]
-	}
-	s = string(r)
-	for len(s) > maxLogText { // multibyte: limit is characters, but keep it conservative
-		r = r[:len(r)-1]
-		s = string(r)
-	}
-	return s
+	return string([]rune(strings.ToValidUTF8(s, "\uFFFD"))[:maxLogText])
 }
 
 func (st *logState) stamp(t time.Time) string {
