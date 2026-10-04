@@ -15,6 +15,8 @@ import (
 )
 
 func main() {
+	initLogging()
+
 	// Deliberately first: the launch fd must be drained and closed, and the
 	// removed credential names unset, before flag defaults read the
 	// environment or any goroutine can call relay.
@@ -84,7 +86,7 @@ func main() {
 	RegisterRoutes(mux, store, scheduler, logStore)
 	mux.HandleFunc("/ws/tasks", HandleWS(hub))
 
-	server := &http.Server{Handler: bearerAuth(*internalToken, mux)}
+	server := &http.Server{Handler: bearerAuth(*internalToken, traceMiddleware(mux))}
 
 	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o700); err != nil {
 		slog.Error("failed to create socket parent dir", "path", *socketPath, "error", err)
