@@ -136,7 +136,7 @@ func TestExecuteTask_ChatTaskWithoutModelFailsWithoutSession(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	s.executeTask(*task)
+	s.executeTask(*task, "testtrace", "run_now")
 
 	if n := projectGets.Load(); n != 0 {
 		t.Errorf("front door got %d GET /api/projects/p1, want 0", n)
@@ -207,7 +207,7 @@ func TestExecuteTask_SessionSettingsFollowUseRelayTools(t *testing.T) {
 				t.Fatalf("Create: %v", err)
 			}
 
-			s.executeTask(*task)
+			s.executeTask(*task, "testtrace", "run_now")
 
 			if len(bodies) != 1 {
 				t.Fatalf("front door got %d POST /api/sessions, want 1", len(bodies))

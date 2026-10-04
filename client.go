@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,6 +36,14 @@ type RelayClient struct {
 	token      string
 	http       *http.Client
 	socketPath string // empty when dialing baseURL over TCP
+	traceID    string // sent as X-Trace-Id on every call when non-empty
+}
+
+// withTrace returns a shallow copy that stamps traceID on every outbound call.
+func (c *RelayClient) withTrace(traceID string) *RelayClient {
+	cp := *c
+	cp.traceID = traceID
+	return &cp
 }
 
 // Project is the part of relay's /api/projects/{id} response the scheduler
@@ -82,6 +91,24 @@ func NewRelayClient(baseURL, socketPath, token string) *RelayClient {
 	}
 }
 
+// traceOnBox reports whether the relay hop stays on this machine: a Unix
+// socket, localhost, or a loopback IP. Trace ids are never sent off-box.
+func (c *RelayClient) traceOnBox() bool {
+	if c.socketPath != "" {
+		return true
+	}
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (c *RelayClient) newRequest(method, path string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequest(method, c.baseURL+path, body)
 	if err != nil {
@@ -90,6 +117,9 @@ func (c *RelayClient) newRequest(method, path string, body io.Reader) (*http.Req
 	req.Header.Set("Content-Type", "application/json")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.traceID != "" && c.traceOnBox() {
+		req.Header.Set(traceHeader, c.traceID)
 	}
 	return req, nil
 }
@@ -184,7 +214,11 @@ func (c *RelayClient) RunChatAndWait(sessionID, prompt string, timeout time.Dura
 	if err := conn.WriteMessage(websocket.TextMessage, join); err != nil {
 		return nil, fmt.Errorf("send join_session: %w", err)
 	}
-	send, _ := json.Marshal(map[string]string{"type": "send_message", "sessionId": sessionID, "text": prompt})
+	sendFrame := map[string]string{"type": "send_message", "sessionId": sessionID, "text": prompt}
+	if c.traceID != "" && c.traceOnBox() {
+		sendFrame["trace_id"] = c.traceID
+	}
+	send, _ := json.Marshal(sendFrame)
 	if err := conn.WriteMessage(websocket.TextMessage, send); err != nil {
 		return nil, fmt.Errorf("send_message: %w", err)
 	}
@@ -430,6 +464,9 @@ func (c *RelayClient) dialWS() (*websocket.Conn, error) {
 	headers := http.Header{}
 	if c.token != "" {
 		headers.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.traceID != "" && c.traceOnBox() {
+		headers.Set(traceHeader, c.traceID)
 	}
 	conn, _, err := dialer.Dial(wsURL, headers)
 	return conn, err

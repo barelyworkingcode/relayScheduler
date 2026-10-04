@@ -302,7 +302,7 @@ func TestRunTaskNow_PtyRunLearnsExitFromCreatedTerminal(t *testing.T) {
 			}
 
 			start := time.Now()
-			if err := s.RunTaskNow(task.ID); err != nil {
+			if err := s.RunTaskNow(task.ID, "testtrace"); err != nil {
 				t.Fatalf("RunTaskNow: %v", err)
 			}
 			var history []Execution

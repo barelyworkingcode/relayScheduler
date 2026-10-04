@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -104,11 +107,13 @@ func (s *Scheduler) checkAndFireTasks() {
 		// A skipped one-shot has no next occurrence. Disable it rather than
 		// leave it enabled but never scheduled.
 		if st, _ := ScheduleType(task.Schedule); st == "once" {
-			slog.Info("disabling missed one-shot task (catch-up disabled)", "task", task.Name)
+			slog.Info("disabled missed one-shot job (catch-up off)",
+				"op", "job.skip", "job_id", task.ID, "status", "ok", "duration_ms", 0)
 			s.store.SetEnabled(task.ID, false)
 			continue
 		}
-		slog.Info("skipping missed task (catch-up disabled)", "task", task.Name)
+		slog.Info("skipped missed job (catch-up off)",
+			"op", "job.skip", "job_id", task.ID, "status", "ok", "duration_ms", 0)
 		s.scheduleTaskLocked(task)
 	}
 	for _, task := range toFire {
@@ -117,7 +122,7 @@ func (s *Scheduler) checkAndFireTasks() {
 	s.mu.Unlock()
 
 	for _, task := range toFire {
-		go s.executeTask(task)
+		go s.executeTask(task, newTraceID(), "schedule")
 	}
 }
 
@@ -144,7 +149,7 @@ func (s *Scheduler) LoadAllTasks() error {
 	for _, task := range tasks {
 		// A "running" status at startup means the previous process died mid-run.
 		if task.LastStatus == "running" {
-			slog.Warn("resetting stale running task", "task", task.Name, "id", task.ID)
+			slog.Warn("resetting stale running job", "job_id", task.ID)
 			s.store.SetLastRun(task.ID, "error")
 		}
 		if !task.Enabled {
@@ -196,7 +201,7 @@ func (s *Scheduler) scheduleTaskLocked(task Task) {
 
 	nextRun, err := CalculateNextRun(task.Schedule)
 	if err != nil {
-		slog.Error("failed to calculate next run", "task", task.Name, "error", err)
+		slog.Error("failed to calculate next run", "job_id", task.ID, "error", "schedule invalid")
 		return
 	}
 
@@ -204,17 +209,67 @@ func (s *Scheduler) scheduleTaskLocked(task Task) {
 		task:    task,
 		nextRun: nextRun,
 	}
-	slog.Info("scheduled task", "task", task.Name, "nextRun", nextRun.UTC().Format(time.RFC3339))
+	slog.Info("scheduled job", "job_id", task.ID, "nextRun", nextRun.UTC().Format(time.RFC3339))
 }
 
-func (s *Scheduler) executeTask(task Task) {
+// newRunID returns a fresh id for one fire of a job. It is separate from the
+// wire runId, which is the session or terminal id.
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// runCtx carries what one run needs: its logging context, a trace-stamped
+// client, and the fields of its single job.fire end line.
+type runCtx struct {
+	ctx     context.Context
+	client  *RelayClient
+	runID   string
+	trigger string
+	start   time.Time
+}
+
+// finish logs the run's one job.fire line. errPhrase is a fixed phrase naming
+// the stage that failed; never pass err.Error(), which can embed response bodies.
+func (rc *runCtx) finish(task Task, ok bool, errPhrase string) {
+	level, status, msg := slog.LevelInfo, "ok", "job finished"
+	if !ok {
+		level, status, msg = slog.LevelError, "error", "job failed"
+	}
+	attrs := []slog.Attr{
+		slog.String("op", "job.fire"),
+		slog.String("job_id", task.ID),
+		slog.String("run_id", rc.runID),
+		slog.String("trigger", rc.trigger),
+		slog.String("status", status),
+		slog.Int64("duration_ms", time.Since(rc.start).Milliseconds()),
+	}
+	if !ok {
+		attrs = append(attrs, slog.String("error", errPhrase))
+	}
+	slog.LogAttrs(rc.ctx, level, msg, attrs...)
+}
+
+// executeTask runs one fire of a job. It builds its own context so the run
+// outlives any request that started it.
+func (s *Scheduler) executeTask(task Task, traceID, trigger string) {
 	defer func() {
 		s.mu.Lock()
 		delete(s.running, task.ID)
 		s.mu.Unlock()
 	}()
 
-	slog.Info("executing task", "task", task.Name, "projectId", task.ProjectID, "sessionType", task.SessionType)
+	rc := &runCtx{
+		ctx:     withTrace(context.Background(), traceID),
+		client:  s.client.withTrace(traceID),
+		runID:   newRunID(),
+		trigger: trigger,
+		start:   time.Now(),
+	}
+	client := rc.client
 
 	// One live run per task: remove the previous run's session or terminal
 	// before starting a new one.
@@ -222,11 +277,11 @@ func (s *Scheduler) executeTask(task Task) {
 		switch current.SessionType {
 		case SessionTypePTY:
 			if current.LastTerminalID != "" {
-				s.client.CloseTerminal(current.LastTerminalID)
+				client.CloseTerminal(current.LastTerminalID)
 			}
 		default:
 			if current.LastSessionID != "" {
-				s.client.DeleteSession(current.LastSessionID)
+				client.DeleteSession(current.LastSessionID)
 			}
 		}
 	}
@@ -243,27 +298,27 @@ func (s *Scheduler) executeTask(task Task) {
 	s.store.SetLastRun(task.ID, "running")
 
 	if task.SessionType != SessionTypePTY && strings.TrimSpace(task.Model) == "" {
-		s.failRun(task, exec, fmt.Errorf("task %q has no model; edit the task and choose one", task.Name))
+		s.failRun(rc, task, exec, fmt.Errorf("task %q has no model; edit the task and choose one", task.Name), "model missing")
 		return
 	}
 
 	// Resolve the project so we can pass `directory` + `projectId` to relayLLM
 	// — relayLLM is a pure execution engine and has no project awareness; relay
 	// brokers the scoped token from the projectId.
-	project, err := s.client.GetProject(task.ProjectID)
+	project, err := client.GetProject(task.ProjectID)
 	if err != nil {
-		s.failRun(task, exec, err)
+		s.failRun(rc, task, exec, err, "project lookup failed")
 		return
 	}
 
 	if task.SessionType == SessionTypePTY {
-		s.runPtyTask(task, project, exec)
+		s.runPtyTask(rc, task, project, exec)
 		return
 	}
 
-	session, err := s.client.CreateSessionWithTools(project, task.Model, task.Name, task.UseRelayTools)
+	session, err := client.CreateSessionWithTools(project, task.Model, task.Name, task.UseRelayTools)
 	if err != nil {
-		s.failRun(task, exec, err)
+		s.failRun(rc, task, exec, err, "session create failed")
 		return
 	}
 
@@ -278,7 +333,7 @@ func (s *Scheduler) executeTask(task Task) {
 	if timeout <= 0 {
 		timeout = defaultChatTimeout
 	}
-	result, err := s.client.RunChatAndWait(session.SessionID, task.Prompt, timeout)
+	result, err := client.RunChatAndWait(session.SessionID, task.Prompt, timeout)
 	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 	switch {
 	case errors.Is(err, ErrChatTimeout):
@@ -286,18 +341,17 @@ func (s *Scheduler) executeTask(task Task) {
 		exec.Error = "task exceeded maxDurationSeconds"
 		// Stop the still-running generation so it doesn't linger until the
 		// provider's own idle timeout.
-		s.client.StopGeneration(session.SessionID)
-		slog.Warn("task timed out", "task", task.Name, "timeout", timeout)
+		client.StopGeneration(session.SessionID)
+		rc.finish(task, false, "timeout")
 	case err != nil:
 		exec.Status = "error"
 		exec.Error = err.Error()
-		slog.Error("task execution failed", "task", task.Name, "error", err)
+		rc.finish(task, false, "chat run failed")
 	default:
 		exec.Status = "success"
 		exec.Response = result.Response
 		exec.Stats = &result.Stats
-		slog.Info("task completed", "task", task.Name,
-			"tokens", result.Stats.InputTokens+result.Stats.OutputTokens)
+		rc.finish(task, true, "")
 	}
 
 	// The session stays alive so eve can open this run; the next run deletes it.
@@ -316,7 +370,7 @@ func (s *Scheduler) executeTask(task Task) {
 
 // failRun records a run that failed before its session or terminal existed.
 // PTY runs get ExitCodeCreateFailed so their history always carries an exit code.
-func (s *Scheduler) failRun(task Task, exec Execution, err error) {
+func (s *Scheduler) failRun(rc *runCtx, task Task, exec Execution, err error, phrase string) {
 	exec.Status = "error"
 	exec.Error = err.Error()
 	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
@@ -326,7 +380,7 @@ func (s *Scheduler) failRun(task Task, exec Execution, err error) {
 		exec.ExitCode = &exitCode
 		extra["exitCode"] = exitCode
 	}
-	slog.Error("task failed to start", "task", task.Name, "sessionType", task.SessionType, "error", err)
+	rc.finish(task, false, phrase)
 	s.logStore.Log(task.ProjectID, task.ID, exec)
 	s.store.SetLastRun(task.ID, "error")
 	s.broadcastTaskEvent("task_error", task, "", extra)
@@ -349,7 +403,7 @@ func (s *Scheduler) rescheduleOrDisable(task Task) {
 		s.mu.Lock()
 		delete(s.tasks, task.ID)
 		s.mu.Unlock()
-		slog.Info("disabled one-shot task after execution", "task", task.Name)
+		slog.Info("disabled one-shot job after execution", "job_id", task.ID)
 		return
 	}
 
@@ -408,9 +462,9 @@ func (s *Scheduler) broadcastTaskEvent(eventType string, task Task, runID string
 //
 // The starting `exec` already has TaskID/TaskName/ProjectID/StartedAt set
 // and Status="running" from executeTask.
-func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
+func (s *Scheduler) runPtyTask(rc *runCtx, task Task, project *Project, exec Execution) {
 	if task.TemplateID == "" {
-		s.failRun(task, exec, errors.New("PTY task missing templateId"))
+		s.failRun(rc, task, exec, errors.New("PTY task missing templateId"), "template missing")
 		return
 	}
 
@@ -424,9 +478,9 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 	projectForTerminal.Path = directory
 
 	runStart := time.Now()
-	term, err := s.client.CreateTerminal(&projectForTerminal, task.TemplateID, task.Name, task.ExtraArgs)
+	term, err := rc.client.CreateTerminal(&projectForTerminal, task.TemplateID, task.Name, task.ExtraArgs)
 	if err != nil {
-		s.failRun(task, exec, err)
+		s.failRun(rc, task, exec, err, "terminal create failed")
 		return
 	}
 
@@ -440,7 +494,7 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 		timeout = defaultPtyTimeout
 	}
 
-	exitCode, attachErr := s.client.AttachTerminalAndWait(term.ID, timeout)
+	exitCode, attachErr := rc.client.AttachTerminalAndWait(term.ID, timeout)
 	exec.ExitCode = &exitCode
 	exec.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 
@@ -448,13 +502,13 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 	// otherwise the child can keep writing bytes during the read and we'd
 	// capture a racy/partial snapshot.
 	if exitCode == ExitCodeTimeout {
-		s.client.CloseTerminal(term.ID)
+		rc.client.CloseTerminal(term.ID)
 	}
 
 	// Log preview for the execution record. Eve renders the full stream
 	// via /api/terminals/{id}/log; this is just a quick glance for the
 	// history list. Best-effort: never fail the run on a read error.
-	if logBytes, lerr := s.client.GetTerminalLog(term.ID); lerr == nil {
+	if logBytes, lerr := rc.client.GetTerminalLog(term.ID); lerr == nil {
 		const maxPreview = 16 * 1024
 		if len(logBytes) > maxPreview {
 			logBytes = logBytes[len(logBytes)-maxPreview:]
@@ -487,6 +541,19 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 		exec.Error = fmt.Sprintf("process exited with code %d", exitCode)
 	}
 
+	switch {
+	case exec.Status == "success":
+		rc.finish(task, true, "")
+	case exitCode == ExitCodeTimeout:
+		rc.finish(task, false, "timeout")
+	case exitCode < 0:
+		rc.finish(task, false, "terminal attach failed")
+	case exitCode > 0:
+		rc.finish(task, false, "process exited nonzero")
+	default:
+		rc.finish(task, false, "output file failed")
+	}
+
 	s.logStore.Log(task.ProjectID, task.ID, exec)
 	s.store.SetLastRun(task.ID, exec.Status)
 
@@ -501,7 +568,7 @@ func (s *Scheduler) runPtyTask(task Task, project *Project, exec Execution) {
 	s.rescheduleOrDisable(task)
 }
 
-func (s *Scheduler) RunTaskNow(taskID string) error {
+func (s *Scheduler) RunTaskNow(taskID, traceID string) error {
 	task, err := s.store.Get(taskID)
 	if err != nil {
 		return err
@@ -518,6 +585,6 @@ func (s *Scheduler) RunTaskNow(taskID string) error {
 	s.running[taskID] = struct{}{}
 	s.mu.Unlock()
 
-	go s.executeTask(*task)
+	go s.executeTask(*task, traceID, "run_now")
 	return nil
 }

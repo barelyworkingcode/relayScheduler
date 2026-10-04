@@ -93,7 +93,7 @@ func newPtyRun(t *testing.T, fields string) (*ptyRelay, http.Handler, *Scheduler
 func runAndWait(t *testing.T, h http.Handler, s *Scheduler, id string, runs int) []map[string]interface{} {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for err := s.RunTaskNow(id); err != nil; err = s.RunTaskNow(id) {
+	for err := s.RunTaskNow(id, "testtrace"); err != nil; err = s.RunTaskNow(id, "testtrace") {
 		if !errors.Is(err, ErrTaskRunning) || time.Now().After(deadline) {
 			t.Fatalf("RunTaskNow: %v", err)
 		}
