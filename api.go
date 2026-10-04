@@ -188,7 +188,7 @@ func RegisterRoutes(mux *http.ServeMux, store *TaskStore, scheduler *Scheduler, 
 	})
 
 	mux.HandleFunc("POST /api/tasks/{id}/run", func(w http.ResponseWriter, r *http.Request) {
-		err := scheduler.RunTaskNow(r.PathValue("id"))
+		err := scheduler.RunTaskNow(r.PathValue("id"), traceFrom(r.Context()))
 		switch {
 		case err == nil:
 			writeJSON(w, http.StatusOK, map[string]interface{}{

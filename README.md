@@ -238,6 +238,22 @@ curl --unix-socket ~/Library/Application\ Support/relayScheduler/relayscheduler.
 - `tasks.json`: every task definition, plus each task's last run state.
 - `task-logs/{projectId}-{taskId}.json`: run history, capped at 100 entries.
 
+## Logging
+
+Logs are JSON lines on stderr in the relay logging standard. `RELAY_LOG_LEVEL`
+sets the level (`error`, `warn`, `info`, `debug`; default `info`).
+
+- `trace_id` follows one request or run. Every outbound call to relay carries
+  it as `X-Trace-Id`, and the chat `send_message` frame carries it as
+  `trace_id`. Run-now takes the caller's trace id; a schedule fire makes a new one.
+- `job_id` is the task id and stays the same across runs. `run_id` is new for
+  each fire. Neither is the session or terminal id.
+- `job.fire` is the one end line per run: `status`, `duration_ms`, `trigger`
+  (`schedule` or `run_now`) and, on failure, a fixed `error` phrase naming the
+  stage. It never carries response text.
+- `job.skip` marks a missed run skipped or a one-shot disabled. A tick with
+  nothing due logs nothing.
+
 ## Verification
 
 `go run ./cmd/devboxverify --checkout <PR worktree> --post <N>` drives a
