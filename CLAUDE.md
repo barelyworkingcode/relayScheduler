@@ -128,7 +128,7 @@ go test ./...     # hermetic: fake WS/HTTP servers, temp-dir stores
 
 `docs/FEATURES.md` is the feature map (each row names its simple door, power door and journey). Update it in the PR that adds or changes a feature.
 
-Verify harness (test machine): `go run ./cmd/devboxverify --checkout <PR worktree> --post <N>`.
+The **verify harness** is `cmd/devboxverify`. On the test machine: `go run ./cmd/devboxverify --checkout <PR worktree> --post <N>`.
 
 Keep `gofmt -l .` empty; `.gitattributes` forces LF on `.go` files.
 
