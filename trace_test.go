@@ -132,14 +132,12 @@ func TestAPI_FailedCreateLogsWarnOrError(t *testing.T) {
 		}
 	})
 	t.Run("store failure is an error", func(t *testing.T) {
-		if os.Geteuid() == 0 {
-			t.Skip("root ignores directory permissions")
-		}
 		h, buf, dir := newLoggedAPIDir(t)
-		if err := os.Chmod(dir, 0500); err != nil {
+		// A directory where tasks.json belongs makes every store call fail,
+		// for root too.
+		if err := os.Mkdir(filepath.Join(dir, "tasks.json"), 0700); err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { os.Chmod(dir, 0700) })
 		body := strings.Replace(chatTaskJSON, "summarize", canary, 1)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(body)))
