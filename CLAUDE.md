@@ -49,7 +49,7 @@ relayScheduler is a relay-enhanced service (protocol: `../relay/docs/service-man
   credential in the environment. It sets `RELAY_LAUNCH_FD=3`,
   `RELAY_BRIDGE_SOCKET`, `RELAY_SERVICE_ID`, `RELAY_FRONTEND_SOCKET`, and passes a
   64-hex launch secret on fd 3. `bootstrapLaunchIdentity` is the first thing
-  `main` does: it unsets `RELAY_LAUNCH_FD` and the removed
+  `main` does after `initLogging`: it unsets `RELAY_LAUNCH_FD` and the removed
   `RELAY_SERVICE_TOKEN` / `RELAY_MCP_TOKEN` / `RELAY_FRONTEND_TOKEN`, drains and
   closes fd 3, and sends `Hello`. Any failure while `RELAY_LAUNCH_FD` is set
   exits non-zero; never degrade to standalone. relay then recognises this exact
