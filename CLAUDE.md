@@ -125,6 +125,8 @@ go build .        # plain build
 go test ./...     # hermetic: fake WS/HTTP servers, temp-dir stores
 ```
 
+The **verify harness** is `cmd/devboxverify` (added in #17). On the test machine: `go run ./cmd/devboxverify --checkout <PR worktree> --post <N>`.
+
 Keep `gofmt -l .` empty; `.gitattributes` forces LF on `.go` files.
 
 ## Ecosystem
