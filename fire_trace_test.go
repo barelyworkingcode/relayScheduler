@@ -63,13 +63,14 @@ type fireRelay struct {
 	mu           sync.Mutex
 	calls        []relayCall
 	frames       []map[string]any
-	hang         bool // chat turn never completes
+	frameSignal  chan struct{} // pinged (non-blocking) after each recorded frame
+	hang         bool          // chat turn never completes
 	projectFails bool
 }
 
 func newFireRelay(t *testing.T) *fireRelay {
 	t.Helper()
-	f := &fireRelay{}
+	f := &fireRelay{frameSignal: make(chan struct{}, 1)}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.calls = append(f.calls, relayCall{r.Method, r.URL.Path, r.Header.Get("X-Trace-Id")})
@@ -113,6 +114,10 @@ func (f *fireRelay) serveWS(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.frames = append(f.frames, m)
 		f.mu.Unlock()
+		select {
+		case f.frameSignal <- struct{}{}:
+		default:
+		}
 		switch m["type"] {
 		case "join_terminal":
 			_ = conn.WriteJSON(map[string]any{"type": "terminal_exit", "exitCode": 0})
@@ -128,6 +133,26 @@ func (f *fireRelay) snapshot() ([]relayCall, []map[string]any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]relayCall(nil), f.calls...), append([]map[string]any(nil), f.frames...)
+}
+
+// waitForFrame blocks until a recorded frame satisfies match, waking on the
+// frame signal rather than polling.
+func (f *fireRelay) waitForFrame(t *testing.T, desc string, match func(map[string]any) bool) {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	for {
+		_, frames := f.snapshot()
+		for _, fr := range frames {
+			if match(fr) {
+				return
+			}
+		}
+		select {
+		case <-f.frameSignal:
+		case <-timeout:
+			t.Fatalf("timed out waiting for frame %s; got %v", desc, frames)
+		}
+	}
 }
 
 // assertTraced requires every recorded call to carry want and every
@@ -248,8 +273,11 @@ func TestFire_ChatRunTracesEveryCallAndTimeoutIsError(t *testing.T) {
 	e.s.executeTask(*task, "chattrace-01", "schedule")
 
 	e.relay.assertTraced(t, "chattrace-01",
-		"GET /api/projects/p1", "POST /api/sessions/old-sess/delete", "POST /api/sessions",
-		"GET /ws", "POST /api/sessions/s-new1/stop")
+		"GET /api/projects/p1", "DELETE /api/sessions/old-sess", "POST /api/sessions",
+		"GET /ws")
+	e.relay.waitForFrame(t, "stop_generation for s-new1", func(f map[string]any) bool {
+		return f["type"] == "stop_generation" && f["sessionId"] == "s-new1"
+	})
 	_, frames := e.relay.snapshot()
 	var sent map[string]any
 	for _, f := range frames {
