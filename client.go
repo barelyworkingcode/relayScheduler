@@ -302,16 +302,31 @@ func (c *RelayClient) fireAndForget(method, path string) {
 	resp.Body.Close()
 }
 
+// stopWriteTimeout bounds the stop frame write so a hung relay cannot block
+// the scheduler on a best-effort cleanup call.
+const stopWriteTimeout = 3 * time.Second
+
 // StopGeneration aborts an in-flight LLM response without ending the session.
+// Relay serves this as a stop_generation frame on /ws, not an HTTP route.
+// Best-effort: dial and write errors are swallowed.
 func (c *RelayClient) StopGeneration(sessionID string) {
-	c.fireAndForget(http.MethodPost, fmt.Sprintf("/api/sessions/%s/stop", sessionID))
+	conn, err := c.dialWS()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	frame, _ := json.Marshal(map[string]string{
+		"type":      "stop_generation",
+		"sessionId": sessionID,
+	})
+	_ = conn.SetWriteDeadline(time.Now().Add(stopWriteTimeout))
+	_ = conn.WriteMessage(websocket.TextMessage, frame)
 }
 
-// DeleteSession removes the session from memory and disk on relayLLM.
-// Uses POST /api/sessions/{id}/delete rather than the DELETE verb — the
-// DELETE handler only ends the session and keeps the file on disk.
+// DeleteSession removes the session from memory and disk on relay-sessions.
+// DELETE /api/sessions/{id} kills the provider and removes the persisted file.
 func (c *RelayClient) DeleteSession(sessionID string) {
-	c.fireAndForget(http.MethodPost, fmt.Sprintf("/api/sessions/%s/delete", sessionID))
+	c.fireAndForget(http.MethodDelete, fmt.Sprintf("/api/sessions/%s", sessionID))
 }
 
 // --- Terminal/PTY methods ---
