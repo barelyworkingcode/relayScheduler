@@ -256,11 +256,12 @@ sets the level (`error`, `warn`, `info`, `debug`; default `info`).
 
 ## Verification
 
-`go run ./cmd/devboxverify --checkout <PR worktree> --post <N>` drives a
-terminal routine through relay's front door on the test machine and posts the
-`devbox/verify` status. Usage, environment and prerequisites:
+`go test ./...` is the proof that runs. The devbox harness `cmd/devboxverify`
+(a terminal routine driven through relay's front door, posting a `devbox/verify`
+status) is retired: no test machine runs it, and a PR that needs a real-app
+check says `needs a lab pass`. Its history:
 [cmd/devboxverify/README.md](./cmd/devboxverify/README.md). The features and
-the journeys that cover them: [docs/FEATURES.md](./docs/FEATURES.md).
+the journeys that once covered them: [docs/FEATURES.md](./docs/FEATURES.md).
 
 ## Ecosystem
 
