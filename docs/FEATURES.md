@@ -1,7 +1,7 @@
 # relayScheduler feature map
 
 What a person does with relayScheduler, where it surfaces, and the devbox
-journey that proves it works today. A PR that adds or changes a feature
+journey that proved it worked (history: the devbox is retired, no journey runs now). A PR that adds or changes a feature
 updates this file.
 
 Columns:
@@ -15,7 +15,7 @@ Columns:
 - **Simple door**: what an everyday user does in eve, or `none`.
 - **Power door**: the task API field or route, or `none`. relayScheduler has no
   CLI, so the API is the power door.
-- **Journey**: an existing `devboxverify` journey, or `none`.
+- **Journey**: an existing `devboxverify` journey (retired, history), or `none`.
 
 There is no Gate column, unlike relay's map. relayScheduler has no owner-gated
 operation; the harness holds one proxy-class credential and nothing more.
